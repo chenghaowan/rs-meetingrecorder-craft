@@ -1,0 +1,63 @@
+# ltl-meetingrecordCraft 配置(%APPDATA%\ltl-meetingrecord\config.toml)
+# 全部字段都有默认值;最小可用只需填 [llm].api_key
+
+[whisper]
+# ggml 模型路径;留空则自动找 exe 目录 models\*.bin 或数据目录 models\*.bin
+# 下载: https://huggingface.co/ggerganov/whisper.cpp (ggml-small.bin 起)
+model_path = ""
+language = "zh"          # zh / en / auto
+window_secs = 12.0       # 流式解码窗口
+
+[diarize]
+python = ""              # python 解释器;留空用 PATH 上的 python
+script = ""              # diarize.py 路径;留空自动找 scripts\diarize.py
+hf_token = ""            # HuggingFace token(pyannote 模型)
+enabled = true
+timeout_secs = 600
+
+[llm]
+# OpenAI 兼容端点(dashscope / deepseek / ollama / vllm 均可)
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = ""             # 必填才能出 LLM 总结
+model = "qwen-long"      # 长上下文模型优先(15万字转写要 >=128k 上下文)
+temperature = 0.2
+timeout_secs = 300
+context_tokens = 200000  # 超过 0.8 倍自动降级为两段总结+合并
+json_schema = true       # 端点不支持 json_schema 时改 false
+max_retries = 3
+
+[shots]
+# pointtofixcraft 的截图库;留空用默认 %APPDATA%\pointtofix\gallery.db
+db_path = ""
+root = ""
+context_window_secs = 30.0   # 截图时刻 ±N 秒的发言作为 context
+
+[rag]
+# ym3dRagCraft 的 /ingest 基址;留空跳过入库
+base_url = ""
+timeout_secs = 60
+
+[post]
+chunk_window_secs = 300.0    # chunk 时间窗
+chunk_token_limit = 1000     # chunk token 上限(近似)
+voiceprint_match = 0.65      # >=此值自动预填名
+voiceprint_uncertain = 0.55  # [此值,match) 标疑似
+voiceprint_max_samples = 10  # 每人保留声纹样本数
+
+# ── GUI(recorder)──
+# 主悬浮面板置顶
+main_on_top = true
+
+[subtitle]
+enabled = true           # 录音中显示屏幕底部字幕条
+always_on_top = true     # 字幕窗口置顶
+font_size = 26.0         # 字号(逻辑像素)
+opacity = 0.55           # 背景不透明度 0~1
+bottom_margin = 48.0     # 距屏幕底部边距
+
+[tools]
+# pointtofixcraft(截图工具)获取来源:http(s) .exe 直链,或本地便携 exe/目录;
+# 留空 = 自动找兄弟仓库 …\pointtofixcraft\dist\pointtofix-portable
+pointtofix_url = ""
+# 已安装位置覆盖;留空 = %APPDATA%\ltl-meetingrecord	ools\pointtofix\pointtofix.exe
+pointtofix_exe = ""

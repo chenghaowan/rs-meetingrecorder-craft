@@ -1,0 +1,26 @@
+[package]
+name = "mrc-recorder"
+version.workspace = true
+edition.workspace = true
+description = "会议记录常驻端:悬浮面板 + 屏幕底部字幕 + 设置/命名 + 实时采集转写"
+
+[[bin]]
+name = "mrc-recorder"
+path = "src/main.rs"
+
+[dependencies]
+mrc-core = { path = "../core" }
+anyhow.workspace = true
+rusqlite.workspace = true
+toml.workspace = true
+serde_json.workspace = true
+eframe = "0.31"
+tray-icon = "0.21"
+image = { version = "0.25", default-features = false, features = ["png"] }
+global-hotkey = "0.7"
+# 主屏尺寸/字幕条定位(Win32 GetSystemMetrics)
+windows = { version = "0.62", features = ["Win32_UI_WindowsAndMessaging", "Win32_Globalization"] }
+
+[package.metadata.notes]
+f8 = "F8 留给 pointtofixcraft 截图;本工具用 F9 开始/结束会议"
+subtitle = "字幕条是第二个原生视口(show_viewport_immediate),置顶/字号/透明度可配"

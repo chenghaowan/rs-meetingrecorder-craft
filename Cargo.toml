@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/recorder", "crates/postprocess"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+ureq = { version = "2", features = ["json", "tls"] }
+chrono = "0.4"
+hound = "3"
+toml = "0.8"
+base64 = "0.22"
+
+[profile.dev.package."*"]
+# 依赖用轻量优化(whisper/SQLite 在 debug 下慢到不可用),自身代码保持快速编译
+opt-level = 1
+
+[profile.release]
+strip = true
+lto = "thin"

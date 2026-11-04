@@ -1,0 +1,16 @@
+[package]
+name = "mrc-postprocess"
+version.workspace = true
+edition.workspace = true
+description = "会议后处理 CLI:重跑流水线/命名/RAG 重试/fixture"
+
+[[bin]]
+name = "mrc-postprocess"
+path = "src/main.rs"
+
+[dependencies]
+mrc-core = { path = "../core" }
+anyhow.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
