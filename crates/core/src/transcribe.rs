@@ -107,6 +107,107 @@ impl Transcriber {
     }
 }
 
+/// 把 16k mono f32 样本编码为 WAV 字节(网关 /asr 上传用)。
+pub fn encode_wav_16k(samples: &[f32]) -> Vec<u8> {
+    let data_len = samples.len() * 2;
+    let mut out = Vec::with_capacity(44 + data_len);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());      // fmt 块长
+    out.extend_from_slice(&1u16.to_le_bytes());       // PCM
+    out.extend_from_slice(&1u16.to_le_bytes());       // 单声道
+    out.extend_from_slice(&(TARGET_RATE as u32).to_le_bytes());
+    out.extend_from_slice(&(TARGET_RATE as u32 * 2).to_le_bytes()); // byte rate
+    out.extend_from_slice(&2u16.to_le_bytes());       // block align
+    out.extend_from_slice(&16u16.to_le_bytes());      // bits
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// 网关 /asr 执行器(契约:POST 二进制 WAV,响应 JSON segments;网关 M4)。
+pub struct RemoteAsr {
+    pub gateway_url: String,
+    pub language: String,
+    agent: ureq::Agent,
+}
+
+/// 远端返回的宽容段落(秒或毫秒都能吃)
+#[derive(Debug, Clone)]
+pub struct RemoteSegment {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+impl RemoteAsr {
+    pub fn new(gateway_url: &str, language: &str) -> Self {
+        Self {
+            gateway_url: gateway_url.trim_end_matches('/').to_string(),
+            language: language.to_string(),
+            agent: ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(120))
+                .build(),
+        }
+    }
+
+    pub fn transcribe(&self, samples: &[f32]) -> Result<Vec<RemoteSegment>> {
+        let wav = encode_wav_16k(samples);
+        let url = format!(
+            "{}/asr?lang={}",
+            self.gateway_url,
+            if self.language == "auto" { "auto" } else { &self.language }
+        );
+        let resp = self
+            .agent
+            .post(&url)
+            .set("Content-Type", "audio/wav")
+            .send_bytes(&wav)
+            .map_err(|e| anyhow::anyhow!("网关 {url} 不可用: {e}"))?;
+        let v: serde_json::Value = resp.into_json().context("网关 /asr 响应解析失败")?;
+        if let Some(err) = v["error"].as_object() {
+            anyhow::bail!(
+                "网关错误 [{}]: {}",
+                err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown"),
+                err.get("message").and_then(|m| m.as_str()).unwrap_or("?")
+            );
+        }
+        let arr = v["segments"]
+            .as_array()
+            .or_else(|| v["data"].as_array())
+            .ok_or_else(|| anyhow::anyhow!("网关响应缺 segments"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for seg in arr {
+            // start/end 秒或毫秒(>1000 视为毫秒);兼容 start_ms/end_ms 键
+            let get_ms = |a: &serde_json::Value, b: &str, c: &str| -> i64 {
+                if let Some(x) = a[b].as_f64() {
+                    if x > 1000.0 { x as i64 } else { (x * 1000.0) as i64 }
+                } else if let Some(x) = a[c].as_f64() {
+                    if x > 1000.0 { x as i64 } else { (x * 1000.0) as i64 }
+                } else {
+                    0
+                }
+            };
+            let text = seg["text"].as_str().unwrap_or("").trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            out.push(RemoteSegment {
+                start_ms: get_ms(seg, "start", "start_ms"),
+                end_ms: get_ms(seg, "end", "end_ms"),
+                text,
+            });
+        }
+        Ok(out)
+    }
+}
+
 /// 读取任意 WAV,重采样为 16k mono f32(离线转写用)。
 pub fn load_wav_16k(path: &std::path::Path) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(path)
@@ -158,6 +259,8 @@ pub fn load_wav_16k(path: &std::path::Path) -> Result<Vec<f32>> {
 /// 流式解码循环状态机:供解码线程每 tick 调用。
 pub struct Streaming {
     pub transcriber: Option<Transcriber>,
+    /// wanai 网关执行器(与 transcriber 并存:远端失败回落本地,不丢内容)
+    pub remote: Option<RemoteAsr>,
     pub window_secs: f64,
     /// 已落库的最后确定点(会议相对毫秒)
     pub committed_ms: i64,
@@ -176,9 +279,40 @@ impl Streaming {
     pub fn new(transcriber: Option<Transcriber>, window_secs: f64) -> Self {
         Self {
             transcriber,
+            remote: None,
             window_secs,
             committed_ms: 0,
         }
+    }
+
+    /// 解码一窗:provider=wanai 先走网关,失败回落本地 whisper-rs
+    pub fn decode_window(
+        &self,
+        tr: &Transcriber,
+        buf: &[f32],
+        buf_start_ms: i64,
+    ) -> Result<Vec<RawSegment>> {
+        if let Some(remote) = self.remote.as_ref() {
+            match remote.transcribe(buf) {
+                Ok(segs) => {
+                    return Ok(segs
+                        .into_iter()
+                        .map(|r| RawSegment {
+                            start_ms: buf_start_ms + r.start_ms,
+                            end_ms: buf_start_ms + r.end_ms,
+                            text: r.text,
+                        })
+                        .collect());
+                }
+                Err(e) => {
+                    // 网关未就绪(M4 前常态):回落本地,只提示一次由调用方日志控制
+                    return tr
+                        .decode(buf, buf_start_ms)
+                        .map_err(|le| anyhow::anyhow!("网关/本地均失败: {e}; 本地: {le}"));
+                }
+            }
+        }
+        tr.decode(buf, buf_start_ms)
     }
 
     /// 每个解码 tick:从 shared 取样本,够一个窗口才解;返回事件并处理 give_back。
@@ -203,7 +337,7 @@ impl Streaming {
             return StreamEvent::Idle;
         }
 
-        match tr.decode(&buf, buf_start_ms) {
+        match self.decode_window(tr, &buf, buf_start_ms) {
             Ok(segs) => {
                 // 最后确定点 E(相对会议)
                 let last_end = segs.last().map(|s| s.end_ms).unwrap_or(buf_start_ms);

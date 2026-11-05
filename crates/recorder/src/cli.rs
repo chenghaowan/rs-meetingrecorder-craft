@@ -18,7 +18,7 @@ use mrc_core::capture;
 use mrc_core::config::Config;
 use mrc_core::db;
 use mrc_core::pipeline::{self, PipelineStop};
-use mrc_core::transcribe::{Streaming, Transcriber};
+use mrc_core::transcribe::{RemoteAsr, Streaming, Transcriber};
 use mrc_core::tools;
 use mrc_core::translate::Translator;
 use mrc_core::windowcap;
@@ -149,6 +149,7 @@ pub fn run(action: CliAction) -> i32 {
         CliAction::Bad(msg) => {
             eprintln!("参数错误: {msg}");
             eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --shot-window 关键词 [--shot-window-ocr] | --transcribe <wav> [--model 路径]]");
+    eprintln!("  [whisper] provider = local(默认,进程内) | wanai(网关 /asr,未就绪回落 local)");
             2
         }
         CliAction::Gui => 0,
@@ -156,7 +157,7 @@ pub fn run(action: CliAction) -> i32 {
 }
 
 fn cmd_transcribe(cfg: &Config, wav: &str, model: Option<&str>) -> Result<serde_json::Value> {
-    use mrc_core::transcribe::{load_wav_16k, Transcriber};
+    use mrc_core::transcribe::{load_wav_16k, RemoteAsr, Streaming, Transcriber};
     let path = std::path::Path::new(wav);
     let model_path = model
         .map(std::path::PathBuf::from)
@@ -166,7 +167,15 @@ fn cmd_transcribe(cfg: &Config, wav: &str, model: Option<&str>) -> Result<serde_
     let dur = samples.len() as f64 / 16000.0;
     let t0 = std::time::Instant::now();
     let tr = Transcriber::new(&model_path, &cfg.whisper.language)?;
-    let segs = tr.decode(&samples, 0)?;
+    let mut st = Streaming::new(Some(tr), cfg.whisper.window_secs);
+    if cfg.whisper.provider == "wanai" {
+        st.remote = Some(RemoteAsr::new(&cfg.whisper.gateway_url, &cfg.whisper.language));
+    }
+    let segs = st.decode_window(
+        st.transcriber.as_ref().expect("local transcriber"),
+        &samples,
+        0,
+    )?;
     let elapsed = t0.elapsed().as_secs_f64();
     let items: Vec<serde_json::Value> = segs
         .iter()
@@ -252,6 +261,11 @@ fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
     let cfg2 = cfg.clone();
     let shared2 = shared.clone();
     let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+    let remote_asr = if cfg2.whisper.provider == "wanai" {
+        Some(RemoteAsr::new(&cfg2.whisper.gateway_url, &cfg2.whisper.language))
+    } else {
+        None
+    };
     std::thread::spawn(move || {
         let tr_th = cfg2.lang.as_deref().and_then(Lang::from_code).unwrap_or_else(Lang::detect).strings();
         let transcriber = cfg2.find_whisper_model().and_then(|m| {
@@ -264,6 +278,7 @@ fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
             }
         });
         let mut streaming = Streaming::new(transcriber, cfg2.whisper.window_secs);
+        streaming.remote = remote_asr;
         let mut idx: i64 = 0;
         let res = (|| -> Result<()> {
             let conn = db::open(&cfg2.db_path())?;

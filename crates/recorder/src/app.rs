@@ -16,7 +16,7 @@ use mrc_core::capture::{self, CaptureShared};
 use mrc_core::config::Config;
 use mrc_core::db;
 use mrc_core::pipeline::{self, PipelineStop};
-use mrc_core::transcribe::{Streaming, Transcriber};
+use mrc_core::transcribe::{RemoteAsr, Streaming, Transcriber};
 use mrc_core::translate::Translator;
 use mrc_core::{tools, windowcap};
 
@@ -117,6 +117,8 @@ impl ToolJob {
 
 #[derive(Default)]
 struct Draft {
+    whisper_provider: String,
+    whisper_gateway: String,
     whisper_model: String,
     whisper_lang: String,
     whisper_window: String,
@@ -153,6 +155,8 @@ struct Draft {
 impl Draft {
     fn from_cfg(c: &Config) -> Self {
         Self {
+            whisper_provider: c.whisper.provider.clone(),
+            whisper_gateway: c.whisper.gateway_url.clone(),
             whisper_model: c.whisper.model_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             whisper_lang: c.whisper.language.clone(),
             whisper_window: c.whisper.window_secs.to_string(),
@@ -193,6 +197,16 @@ impl Draft {
 
     fn apply(self, old: &Config) -> Config {
         let mut c = old.clone();
+        let prov = self.whisper_provider.trim();
+        c.whisper.provider = match prov {
+            "wanai" => "wanai".to_string(),
+            _ => "local".to_string(),
+        };
+        c.whisper.gateway_url = if self.whisper_gateway.trim().is_empty() {
+            "http://127.0.0.1:17800".into()
+        } else {
+            self.whisper_gateway.trim().into()
+        };
         let p = self.whisper_model.trim();
         c.whisper.model_path = (!p.is_empty()).then(|| std::path::PathBuf::from(p));
         c.whisper.language = if self.whisper_lang.trim().is_empty() { "zh".into() } else { self.whisper_lang.trim().into() };
@@ -358,6 +372,11 @@ impl App {
         let live2 = std::sync::Arc::clone(&self.live);
         let shared2 = shared.clone();
         let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+        let remote_asr = if cfg2.whisper.provider == "wanai" {
+            Some(RemoteAsr::new(&cfg2.whisper.gateway_url, &cfg2.whisper.language))
+        } else {
+            None
+        };
         // 自动截图(指定窗口,防漏截):间隔 0=关;pointtofix 缺失时静默跳过
         let auto_shots = cfg2.shots.auto_window_secs > 0.0 && !cfg2.shots.default_window.trim().is_empty();
         let shot_every = std::time::Duration::from_secs_f64(cfg2.shots.auto_window_secs.max(1.0));
@@ -376,6 +395,7 @@ impl App {
                 }
             });
             let mut streaming = Streaming::new(transcriber, cfg2.whisper.window_secs);
+            streaming.remote = remote_asr;
             let mut idx: i64 = 0;
             let res = (|| -> Result<()> {
                 let conn = db::open(&cfg2.db_path())?;
@@ -979,6 +999,23 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
             let Some(d) = app.draft.as_mut() else { return };
             ScrollArea::vertical().max_height(430.0).show(ui, |ui| {
                 ui.heading(tr.sec_whisper);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tr.lbl_stt_provider).size(12.5));
+                    let mut prov = d.whisper_provider.clone();
+                    egui::ComboBox::from_id_salt("stt-provider")
+                        .selected_text(match prov.as_str() {
+                            "wanai" => "WanAI (local gw)",
+                            _ => "Local (whisper-rs)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut prov, "local".to_string(), "Local (whisper-rs)");
+                            ui.selectable_value(&mut prov, "wanai".to_string(), "WanAI (local gw)");
+                        });
+                    d.whisper_provider = prov;
+                });
+                if d.whisper_provider == "wanai" {
+                    row(ui, tr.lbl_wanai_url, &mut d.whisper_gateway, tr.hint_wanai_url);
+                }
                 row(ui, tr.lbl_model, &mut d.whisper_model, tr.hint_model);
                 row(ui, tr.lbl_language, &mut d.whisper_lang, "zh / en / auto");
                 row(ui, tr.lbl_window, &mut d.whisper_window, "12");

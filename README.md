@@ -39,6 +39,8 @@ F8 screenshot → gallery.db            Ingest into RAG
 
 ## Features
 
+- **Two STT engines**: `provider = "local"` runs whisper.cpp in-process (default); `provider = "wanai"` routes audio to the WanAI Runtime gateway (`/asr`, model managed centrally by rs-aiprivaderCraft) and silently falls back to local until the gateway ships M4. The exe keeps whisper.cpp baked in either way (a few MB); what the switch removes is the 465 MB model download/management burden.
+
 - **Floating mini panel** (132×96, same size as PointToFix Craft's standby bar): status light, elapsed time, start/stop, always-on-top, draggable.
 - **Live subtitle bar** at the bottom of the screen (a second native viewport): last two transcript lines + a recording timer; on-top, font size, opacity and margin are configurable.
 - **Local transcription** with whisper.cpp (whisper-rs): 12 s sliding window with tail continuation — no duplicated segments.

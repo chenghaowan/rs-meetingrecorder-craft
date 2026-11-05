@@ -9,17 +9,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WhisperCfg {
+    /// "local"(whisper-rs 进程内,默认) | "wanai"(网关 /asr,未就绪自动回落 local)
+    pub provider: String,
     /// ggml 模型路径;留空则依次找 exe 目录 models\、data_dir\models\ 下的 *.bin
     pub model_path: Option<PathBuf>,
     /// 转写语言(zh/en/auto…)
     pub language: String,
     /// 实时解码窗口秒数:攒够这么长就送 whisper,并把已确定的尾巴提交
     pub window_secs: f64,
+    /// wanai 网关地址(rs-aiprivaderCraft;与 [translate] wanai_url 同一个服务)
+    pub gateway_url: String,
 }
 
 impl Default for WhisperCfg {
     fn default() -> Self {
-        Self { model_path: None, language: "zh".into(), window_secs: 12.0 }
+        Self {
+            provider: "local".into(),
+            model_path: None,
+            language: "zh".into(),
+            window_secs: 12.0,
+            gateway_url: "http://127.0.0.1:17800".into(),
+        }
     }
 }
 
@@ -251,9 +261,11 @@ impl Default for Config {
             audio_dir: None,
             packages_dir: None,
             whisper: WhisperCfg {
+                provider: "local".into(),
                 model_path: None,
                 language: "zh".into(),
                 window_secs: 12.0,
+                gateway_url: "http://127.0.0.1:17800".into(),
             },
             diarize: DiarizeCfg {
                 python: None,

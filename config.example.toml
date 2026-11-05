@@ -2,8 +2,12 @@
 # 全部字段都有默认值;最小可用只需填 [llm].api_key
 
 [whisper]
-# ggml 模型路径;留空则自动找 exe 目录 models\*.bin 或数据目录 models\*.bin
-# 下载: https://huggingface.co/ggerganov/whisper.cpp (ggml-small.bin 起)
+# 转写引擎: "local"(whisper-rs 进程内,默认) | "wanai"(网关 /asr,模型归 rs-aiprivaderCraft 管;
+#            网关 M4 就绪前自动回落 local)
+provider = "local"
+gateway_url = "http://127.0.0.1:17800"
+# ggml 模型路径;留空则自动找 cwd/exe 目录 models\*.bin 或数据目录 models\*.bin
+# 下载: python scripts/fetch_whisper.py (hf-mirror 镜像)
 model_path = ""
 language = "zh"          # zh / en / auto
 window_secs = 12.0       # 流式解码窗口
