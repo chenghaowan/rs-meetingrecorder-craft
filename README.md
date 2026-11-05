@@ -103,6 +103,11 @@ mrc-postprocess rag 3              # retry RAG ingestion
 
 An AI-agent skill (`.agents/skills/meetingrecord`) documents the database/package contracts for automated retrieval.
 
+## Live translation & window capture
+
+- **Live subtitle translation** (`[translate]`): `provider = "llm"` reuses the `[llm]` OpenAI-compatible endpoint (zero-code switch once the unified model gateway rs-aiprivaderCraft is up); `"baidu"` uses the Baidu Translate Open API (same appid/secret as ltl-manage); `"none"` disables. LLM mode batches 3-5 lines per call and keeps engineering terms; translations land in `segments.translation`, the second subtitle line, and `transcript.json`.
+- **Window capture**: a window-title keyword is resolved to the exact visible rect (DWM frame bounds) and shot through pointtofixcraft's headless `--capture`. Three entry points: CLI `mrc-recorder --shot-window Teams [--shot-window-ocr]`; the 📷 button on the panel while recording; `auto_window_secs` periodic auto-shots. Occluded/minimized windows capture whatever is on screen in that region (inherent to region capture); per-window content capture is planned.
+
 ## Contracts with sibling tools
 
 - **PointToFix Craft**: this tool opens `%APPDATA%\pointtofix\gallery.db` **read-only** (`shots` table: `created_at` unix ms, `file_path` relative to `gallery\`, plus its OCR text); images are copied into the package.

@@ -37,6 +37,18 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
+    // 轻量列迁移:v0.1.0 的库没有 translation 列
+    let has_translation: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('segments') WHERE name='translation'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_translation {
+        conn.execute_batch("ALTER TABLE segments ADD COLUMN translation TEXT NOT NULL DEFAULT '';")?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meetings (
            id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,11 +242,12 @@ pub struct Segment {
     pub end_ms: i64,
     pub speaker: Option<String>,
     pub text: String,
+    pub translation: String,
 }
 
 pub fn load_segments(conn: &Connection, meeting_id: i64) -> Result<Vec<Segment>> {
     let mut st = conn.prepare(
-        "SELECT idx, start_ms, end_ms, speaker, text
+        "SELECT idx, start_ms, end_ms, speaker, text, translation
          FROM segments WHERE meeting_id=?1 ORDER BY start_ms",
     )?;
     let rows = st.query_map([meeting_id], |r| {
@@ -244,6 +257,7 @@ pub fn load_segments(conn: &Connection, meeting_id: i64) -> Result<Vec<Segment>>
             end_ms: r.get(2)?,
             speaker: r.get(3)?,
             text: r.get(4)?,
+            translation: r.get(5)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -254,7 +268,7 @@ pub fn load_segments(conn: &Connection, meeting_id: i64) -> Result<Vec<Segment>>
 pub fn load_segments_named(conn: &Connection, meeting_id: i64) -> Result<Vec<Segment>> {
     let mut st = conn.prepare(
         "SELECT s.idx, s.start_ms, s.end_ms,
-                COALESCE(sp.name, s.speaker) AS speaker, s.text
+                COALESCE(sp.name, s.speaker) AS speaker, s.text, s.translation
          FROM segments s
          LEFT JOIN speakers sp
            ON sp.meeting_id = s.meeting_id AND sp.speaker_key = s.speaker
@@ -267,9 +281,18 @@ pub fn load_segments_named(conn: &Connection, meeting_id: i64) -> Result<Vec<Seg
             end_ms: r.get(2)?,
             speaker: r.get(3)?,
             text: r.get(4)?,
+            translation: r.get(5)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub fn update_translation(conn: &Connection, idx: i64, meeting_id: i64, translation: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE segments SET translation=?3 WHERE idx=?1 AND meeting_id=?2",
+        rusqlite::params![idx, meeting_id, translation],
+    )?;
+    Ok(())
 }
 
 pub fn upsert_speaker(

@@ -17,6 +17,8 @@ use mrc_core::config::Config;
 use mrc_core::db;
 use mrc_core::pipeline::{self, PipelineStop};
 use mrc_core::transcribe::{Streaming, Transcriber};
+use mrc_core::translate::Translator;
+use mrc_core::{tools, windowcap};
 
 use crate::i18n::{self, Lang};
 use crate::subtitle::{self, SharedLive};
@@ -138,6 +140,13 @@ struct Draft {
     chunk_tokens: String,
     pf_url: String,
     lang_code: String,
+    tr_provider: String,
+    tr_from: String,
+    tr_to: String,
+    tr_appid: String,
+    tr_secret: String,
+    shots_default_win: String,
+    shots_auto: String,
 }
 
 impl Draft {
@@ -166,6 +175,13 @@ impl Draft {
             chunk_tokens: c.post.chunk_token_limit.to_string(),
             pf_url: c.tools.pointtofix_url.clone().unwrap_or_default(),
             lang_code: c.lang.clone().unwrap_or_default(),
+            tr_provider: c.translate.provider.clone(),
+            tr_from: c.translate.from_lang.clone(),
+            tr_to: c.translate.to_lang.clone(),
+            tr_appid: c.translate.appid.clone(),
+            tr_secret: c.translate.secret.clone(),
+            shots_default_win: c.shots.default_window.clone(),
+            shots_auto: c.shots.auto_window_secs.to_string(),
         }
     }
 
@@ -199,6 +215,17 @@ impl Draft {
         c.post.chunk_token_limit = self.parse(&self.chunk_tokens, c.post.chunk_token_limit).clamp(200, 100000);
         c.tools.pointtofix_url = Some(self.pf_url.trim().to_string()).filter(|s| !s.is_empty());
         c.lang = Some(self.lang_code.clone()).filter(|s| !s.is_empty());
+        let prov = self.tr_provider.trim();
+        c.translate.provider = match prov {
+            "llm" | "baidu" => prov.to_string(),
+            _ => "none".to_string(),
+        };
+        c.translate.from_lang = if self.tr_from.trim().is_empty() { "zh".into() } else { self.tr_from.trim().into() };
+        c.translate.to_lang = if self.tr_to.trim().is_empty() { "en".into() } else { self.tr_to.trim().into() };
+        c.translate.appid = self.tr_appid.trim().to_string();
+        c.translate.secret = self.tr_secret.trim().to_string();
+        c.shots.default_window = self.shots_default_win.trim().to_string();
+        c.shots.auto_window_secs = self.parse(&self.shots_auto, c.shots.auto_window_secs).clamp(0.0, 600.0);
         c
     }
 }
@@ -323,6 +350,12 @@ impl App {
         let cfg2 = self.cfg.clone();
         let live2 = std::sync::Arc::clone(&self.live);
         let shared2 = shared.clone();
+        let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+        // 自动截图(指定窗口,防漏截):间隔 0=关;pointtofix 缺失时静默跳过
+        let auto_shots = cfg2.shots.auto_window_secs > 0.0 && !cfg2.shots.default_window.trim().is_empty();
+        let shot_every = std::time::Duration::from_secs_f64(cfg2.shots.auto_window_secs.max(1.0));
+        let mut last_shot = std::time::Instant::now() - shot_every; // 首个 tick 立即截一张
+        let pf_exe = tools::resolve_available(&cfg2);
         std::thread::spawn(move || {
             // 模型加载放线程里(几秒),WAV 归档不等人
             let tr_th = cfg2.lang.as_deref().and_then(Lang::from_code).unwrap_or_else(Lang::detect).strings();
@@ -346,10 +379,30 @@ impl App {
                     }
                     match streaming.tick(&shared2) {
                         mrc_core::transcribe::StreamEvent::Segments(segs) => {
+                            let mut new_texts: Vec<String> = Vec::new();
+                            let mut new_idx: Vec<i64> = Vec::new();
+                            let mut new_start: Vec<i64> = Vec::new();
                             for s in &segs {
                                 db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
+                                new_idx.push(idx);
+                                new_texts.push(s.text.clone());
+                                new_start.push(s.start_ms);
                                 idx += 1;
-                                subtitle::push_line(&live2, s.start_ms, "", &s.text);
+                                subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
+                            }
+                            // 实时翻译(未启用/失败静默,原文照常)
+                            if let Some(tr) = translator.as_ref() {
+                                let outs = tr.translate_batch(&new_texts);
+                                for (k, o) in outs.iter().enumerate() {
+                                    if let Some(v) = o {
+                                        let _ = db::update_translation(&conn, new_idx[k], meeting_id, v);
+                                        if let Ok(mut g) = live2.lock() {
+                                            if let Some(e) = g.segments.iter_mut().rev().find(|e| e.0 == new_start[k] && e.3.is_empty()) {
+                                                e.3 = v.clone();
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         mrc_core::transcribe::StreamEvent::Error(e) => {
@@ -359,13 +412,23 @@ impl App {
                         }
                         mrc_core::transcribe::StreamEvent::Idle => {}
                     }
+                    // 自动窗口截图(失败静默,只打印一次)
+                    if auto_shots && last_shot.elapsed() >= shot_every {
+                        last_shot = std::time::Instant::now();
+                        if let (Some(exe), Ok(info)) = (pf_exe.as_ref(), windowcap::find_window(&cfg2.shots.default_window)) {
+                            match windowcap::capture_window(exe, &info, false) {
+                                Ok(r) => eprintln!("[shots] 窗口截图 #{} {}x{}", r.id.unwrap_or(0), info.w, info.h),
+                                Err(e) => eprintln!("[shots] 自动截图失败: {e:#}"),
+                            }
+                        }
+                    }
                     std::thread::sleep(Duration::from_millis(2000));
                 }
                 // 收尾残余
                 if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.tick(&shared2) {
                     for s in &segs {
                         db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
-                        subtitle::push_line(&live2, s.start_ms, "", &s.text);
+                        subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
                     }
                 }
                 Ok(())
@@ -418,6 +481,35 @@ impl App {
                 g.started_at_ms = 0;
             }
             let _ = tx.send(WorkerMsg::Pipeline { meeting_id: s.meeting_id, outcome });
+        });
+    }
+
+    /// 手动截指定窗口(默认窗口标题取配置;后台线程,不卡 UI)
+    fn shot_window_now(&mut self) {
+        let cfg = self.cfg.clone();
+        let kw = cfg.shots.default_window.trim().to_string();
+        if kw.is_empty() {
+            self.notice = Some((true, self.lang.strings().hint_shot_no_window.into()));
+            return;
+        }
+        let tx = self.worker_tx.clone();
+        let tr_done = self.lang.strings().hint_shot_ok;
+        let tr_fail = self.lang.strings().hint_shot_fail;
+        std::thread::spawn(move || {
+            let outcome = (|| -> anyhow::Result<String> {
+                let exe = tools::resolve_available(&cfg)
+                    .ok_or_else(|| anyhow::anyhow!("pointtofixcraft 未安装"))?;
+                let info = windowcap::find_window(&kw)?;
+                let r = windowcap::capture_window(&exe, &info, false)?;
+                Ok(format!("#{} ({}x{})", r.id.unwrap_or(0), info.w, info.h))
+            })();
+            let _ = tx.send(WorkerMsg::Pipeline {
+                meeting_id: -1,
+                outcome: match outcome {
+                    Ok(msg) => Ok((i18n::fill(tr_done, &[&msg]), None)),
+                    Err(e) => Err(WorkerFail::Fatal(format!("{}: {e:#}", tr_fail))),
+                },
+            });
         });
     }
 
@@ -619,10 +711,19 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                 Color32::from_rgb(225, 228, 235),
             );
             let r_close = head_btn(ui, header.right() - 8.0, header.center().y, "✕");
+            let r_shot = if mode == Mode::Recording {
+                Some(head_btn(ui, header.right() - 34.0, header.center().y, "📷"))
+            } else {
+                None
+            };
             if ui.input(|i| i.pointer.primary_released()) {
                 let p = ui.input(|i| i.pointer.interact_pos().unwrap_or_default());
                 if r_close.contains(p) {
                     app.quit();
+                } else if let Some(rs) = r_shot {
+                    if rs.contains(p) {
+                        app.shot_window_now();
+                    }
                 }
             }
 
@@ -701,7 +802,7 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                             }
                         }
                         ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                            for (rel_ms, spk, text) in lines.iter().rev() {
+                            for (rel_ms, spk, text, trn) in lines.iter().rev() {
                                 let t = (rel_ms / 1000).max(0);
                                 let ts = format!("{:02}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60);
                                 ui.label(
@@ -709,6 +810,9 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                                         .size(12.5)
                                         .color(Color32::from_rgb(210, 214, 222)),
                                 );
+                                if !trn.trim().is_empty() {
+                                    ui.label(RichText::new(format!("      {trn}")).size(11.0).color(Color32::from_rgb(150, 170, 200)));
+                                }
                             }
                         });
                     },
@@ -897,6 +1001,32 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                 row(ui, tr.lbl_chunk_window, &mut d.chunk_window, "300");
                 row(ui, tr.lbl_chunk_tokens, &mut d.chunk_tokens, "1000");
                 row(ui, tr.lbl_rag, &mut d.rag_base, tr.hint_rag);
+                ui.separator();
+                ui.heading(tr.sec_translate);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tr.lbl_tr_provider).size(12.5));
+                    let mut prov = d.tr_provider.clone();
+                    egui::ComboBox::from_id_salt("tr-provider")
+                        .selected_text(match prov.as_str() {
+                            "llm" => "LLM",
+                            "baidu" => "Baidu",
+                            _ => "off",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut prov, "none".to_string(), "off");
+                            ui.selectable_value(&mut prov, "llm".to_string(), "LLM");
+                            ui.selectable_value(&mut prov, "baidu".to_string(), "Baidu");
+                        });
+                    d.tr_provider = prov;
+                });
+                row(ui, tr.lbl_tr_from, &mut d.tr_from, "zh");
+                row(ui, tr.lbl_tr_to, &mut d.tr_to, "en");
+                row(ui, tr.lbl_tr_appid, &mut d.tr_appid, "");
+                row(ui, tr.lbl_tr_secret, &mut d.tr_secret, "");
+                ui.separator();
+                ui.heading(tr.sec_shots);
+                row(ui, tr.lbl_shots_default, &mut d.shots_default_win, tr.hint_shots_default);
+                row(ui, tr.lbl_auto_shots, &mut d.shots_auto, "0");
                 ui.separator();
                 ui.heading(tr.sec_tools);
                 let pf_state = {

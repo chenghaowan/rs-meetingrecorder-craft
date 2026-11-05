@@ -54,6 +54,7 @@ pub fn write_all(inp: &PackageInput, dir: &Path, shot_files: &[(PathBuf, PathBuf
             "end_ms": s.end_ms,
             "speaker": s.speaker,
             "text": s.text,
+            "translation": s.translation,
         })).collect::<Vec<_>>(),
         "chunks": inp.chunks.iter().map(|c| json!({
             "id": format!("chunk{:03}", c.id),

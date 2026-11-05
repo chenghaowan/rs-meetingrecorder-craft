@@ -17,6 +17,8 @@ pub mod rag;
 pub mod shots;
 pub mod tokens;
 pub mod tools;
+pub mod translate;
+pub mod windowcap;
 pub mod transcribe;
 
 pub use config::Config;

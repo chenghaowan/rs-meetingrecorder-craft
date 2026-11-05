@@ -136,6 +136,7 @@ mod tests {
             end_ms: 940_000,
             speaker: Some("Frank".into()),
             text: "这里有缩水风险,建议增加偷胶".into(),
+            translation: String::new(),
         };
         let shot = Shot {
             created_at: 923_000,

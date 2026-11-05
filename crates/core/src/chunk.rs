@@ -80,6 +80,7 @@ mod tests {
             end_ms: start + 1000,
             speaker: Some("SPEAKER_00".into()),
             text: text.into(),
+            translation: String::new(),
         }
     }
 

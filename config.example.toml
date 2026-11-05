@@ -31,6 +31,8 @@ max_retries = 3
 db_path = ""
 root = ""
 context_window_secs = 30.0   # 截图时刻 ±N 秒的发言作为 context
+default_window = ""          # 指定窗口截图:窗口标题关键词(如 "飞书");面板📷/CLI/自动截图共用
+auto_window_secs = 0         # 会议中自动截该窗口的间隔秒;0=关闭
 
 [rag]
 # ym3dRagCraft 的 /ingest 基址;留空跳过入库
@@ -61,3 +63,14 @@ bottom_margin = 48.0     # 距屏幕底部边距
 pointtofix_url = ""
 # 已安装位置覆盖;留空 = %APPDATA%\ltl-meetingrecord	ools\pointtofix\pointtofix.exe
 pointtofix_exe = ""
+
+[translate]
+# 字幕实时翻译: "llm"(复用 [llm] 端点,rs-aiprivaderCraft 网关就位后指向它) | "baidu" | "none"
+provider = "none"
+from_lang = "zh"
+to_lang = "en"
+batch_size = 4              # llm provider 每次调用翻译的段数
+# baidu 凭据(与 ltl-manage .env 同一套)
+appid = ""
+secret = ""
+api_url = "https://fanyi-api.baidu.com/api/trans/vip/translate"

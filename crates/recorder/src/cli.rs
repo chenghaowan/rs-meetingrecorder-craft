@@ -20,6 +20,8 @@ use mrc_core::db;
 use mrc_core::pipeline::{self, PipelineStop};
 use mrc_core::transcribe::{Streaming, Transcriber};
 use mrc_core::tools;
+use mrc_core::translate::Translator;
+use mrc_core::windowcap;
 
 use crate::i18n::Lang;
 
@@ -31,6 +33,8 @@ pub enum CliAction {
     /// 工具子命令(安装/启动 pointtofixcraft)
     ToolInstall { src: Option<String> },
     ToolLaunch,
+    /// 指定窗口截图(经 pointtofixcraft 落库)
+    ShotWindow { keyword: String, ocr: bool },
     Bad(String),
 }
 
@@ -51,6 +55,18 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliAction {
                 return CliAction::ToolInstall { src: args.get(i).cloned() };
             }
             "--tool-launch" => return CliAction::ToolLaunch,
+            "--shot-window" => {
+                i += 1;
+                let keyword = args.get(i).cloned()
+                    .unwrap_or_else(|| std::env::var("LTL_MR_SHOT_WINDOW").unwrap_or_default());
+                return CliAction::ShotWindow { keyword, ocr: false };
+            }
+            "--shot-window-ocr" => {
+                i += 1;
+                let keyword = args.get(i).cloned()
+                    .unwrap_or_else(|| std::env::var("LTL_MR_SHOT_WINDOW").unwrap_or_default());
+                return CliAction::ShotWindow { keyword, ocr: true };
+            }
             other => return CliAction::Bad(format!("未知参数: {other}")),
         }
         i += 1;
@@ -99,13 +115,37 @@ pub fn run(action: CliAction) -> i32 {
                 1
             }
         },
+        CliAction::ShotWindow { keyword, ocr } => match shot_window(&cfg, &keyword, ocr) {
+            Ok(v) => {
+                println!("{v}");
+                0
+            }
+            Err(e) => {
+                eprintln!("错误: {e:#}");
+                1
+            }
+        },
         CliAction::Bad(msg) => {
             eprintln!("参数错误: {msg}");
-            eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch]");
+            eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --shot-window 关键词 [--shot-window-ocr]]");
             2
         }
         CliAction::Gui => 0,
     }
+}
+
+fn shot_window(cfg: &Config, keyword: &str, ocr: bool) -> Result<serde_json::Value> {
+    let kw = if keyword.trim().is_empty() { cfg.shots.default_window.as_str() } else { keyword };
+    let exe = tools::resolve_available(cfg)
+        .ok_or_else(|| anyhow::anyhow!("pointtofixcraft 未安装(--tool-install 或设置里安装)"))?;
+    let info = windowcap::find_window(kw)?;
+    let receipt = windowcap::capture_window(&exe, &info, ocr)?;
+    Ok(serde_json::json!({
+        "window": { "title": info.title, "x": info.x, "y": info.y, "w": info.w, "h": info.h },
+        "shot_id": receipt.id,
+        "file": receipt.file,
+        "ocr": receipt.ocr,
+    }))
 }
 
 fn cmd_status(cfg: &Config) -> i32 {
@@ -160,6 +200,7 @@ fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
     let (done_tx, done_rx) = mpsc::channel::<Result<()>>();
     let cfg2 = cfg.clone();
     let shared2 = shared.clone();
+    let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
     std::thread::spawn(move || {
         let tr_th = cfg2.lang.as_deref().and_then(Lang::from_code).unwrap_or_else(Lang::detect).strings();
         let transcriber = cfg2.find_whisper_model().and_then(|m| {
@@ -182,10 +223,23 @@ fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
                 }
                 match streaming.tick(&shared2) {
                     mrc_core::transcribe::StreamEvent::Segments(segs) => {
+                        let mut new_texts: Vec<String> = Vec::new();
+                        let mut new_idx: Vec<i64> = Vec::new();
                         for s in &segs {
                             db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
+                            new_idx.push(idx);
+                            new_texts.push(s.text.clone());
                             idx += 1;
                             eprintln!("[cli] + {}", s.text.chars().take(50).collect::<String>());
+                        }
+                        if let Some(tr) = translator.as_ref() {
+                            let outs = tr.translate_batch(&new_texts);
+                            for (k, o) in outs.iter().enumerate() {
+                                if let Some(v) = o {
+                                    let _ = db::update_translation(&conn, new_idx[k], meeting_id, v);
+                                    eprintln!("[cli] = {}", v.chars().take(50).collect::<String>());
+                                }
+                            }
                         }
                     }
                     mrc_core::transcribe::StreamEvent::Error(e) => eprintln!("[warn] 转写失败(重试): {e}"),

@@ -84,11 +84,21 @@ pub struct ShotsCfg {
     pub root: Option<PathBuf>,
     /// 截图时间点前后各取多少秒的发言做 context
     pub context_window_secs: f64,
+    /// 指定窗口截图:窗口标题关键词(如 "飞书");留空=面板📷/CLI 需显式给
+    pub default_window: String,
+    /// 会议中自动截指定窗口的间隔秒;0=关闭(防漏截,截图落 gallery 由会议包自动关联)
+    pub auto_window_secs: f64,
 }
 
 impl Default for ShotsCfg {
     fn default() -> Self {
-        Self { db_path: None, root: None, context_window_secs: 30.0 }
+        Self {
+            db_path: None,
+            root: None,
+            context_window_secs: 30.0,
+            default_window: String::new(),
+            auto_window_secs: 0.0,
+        }
     }
 }
 
@@ -152,10 +162,42 @@ pub struct Config {
     pub main_on_top: bool,
     /// 界面语言(zh/en/de/ja);None = 首次跟随系统
     pub lang: Option<String>,
+    /// 字幕实时翻译
+    pub translate: TranslateCfg,
     /// 底部字幕条
     pub subtitle: SubtitleCfg,
     /// 外部工具(pointtofixcraft 截图)
     pub tools: ToolsCfg,
+}
+
+/// 字幕实时翻译配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TranslateCfg {
+    /// "llm"(复用 [llm] 端点) | "baidu" | "none"
+    pub provider: String,
+    pub from_lang: String,
+    pub to_lang: String,
+    /// llm provider:每次调用翻译的段数
+    pub batch_size: usize,
+    /// baidu 凭据
+    pub appid: String,
+    pub secret: String,
+    pub api_url: String,
+}
+
+impl Default for TranslateCfg {
+    fn default() -> Self {
+        Self {
+            provider: "none".into(),
+            from_lang: "zh".into(),
+            to_lang: "en".into(),
+            batch_size: 4,
+            appid: String::new(),
+            secret: String::new(),
+            api_url: "https://fanyi-api.baidu.com/api/trans/vip/translate".into(),
+        }
+    }
 }
 
 /// 外部工具配置
@@ -228,6 +270,8 @@ impl Default for Config {
                 db_path: None,
                 root: None,
                 context_window_secs: 30.0,
+                default_window: String::new(),
+                auto_window_secs: 0.0,
             },
             rag: RagCfg {
                 base_url: None,
@@ -244,6 +288,7 @@ impl Default for Config {
             lang: None,
             subtitle: SubtitleCfg::default(),
             tools: ToolsCfg::default(),
+            translate: TranslateCfg::default(),
         }
     }
 }

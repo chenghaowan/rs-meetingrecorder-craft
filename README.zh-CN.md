@@ -103,6 +103,11 @@ mrc-postprocess rag 3              # 重试 RAG 入库
 
 AI 代理技能(`.agents/skills/meetingrecord`)文档化了数据库/会议包契约,供自动化检索使用。
 
+## 字幕翻译与窗口截图
+
+- **字幕实时翻译**(`[translate]`):`provider = "llm"` 复用 `[llm]` 的 OpenAI 兼容端点(统一模型网关 rs-aiprivaderCraft 就位后指向它即可,零改动切换);`"baidu"` 走百度翻译开放 API(与 ltl-manage 同一套 appid/secret);`"none"` 关闭。llm 模式按 3~5 段攒批翻译,术语按行业惯例保留;译文写进 `segments.translation`、字幕条第二行、`transcript.json`。
+- **指定窗口截图**:窗口标题关键词 → DWM 精确可见矩形 → 复用 pointtofixcraft 无头 `--capture` 落库。三处入口:CLI `mrc-recorder --shot-window 飞书 [--shot-window-ocr]`;面板录音中 📷 按钮;`auto_window_secs` 定时自动截图(防漏截)。被遮挡/最小化的窗口截到的是屏幕该区域当前内容(区域截图本质限制);窗口内容级截取在二期。
+
 ## 与兄弟工具的契约
 
 - **PointToFix Craft**:本工具**只读**打开 `%APPDATA%\pointtofix\gallery.db`(`shots` 表:`created_at` unix 毫秒、`file_path` 相对 `gallery\`、含 OCR 文本);图片复制进会议包。

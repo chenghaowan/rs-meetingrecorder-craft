@@ -12,8 +12,8 @@ use crate::screen;
 /// 实时链路共享状态(转写线程写,UI/字幕条读)
 #[derive(Default)]
 pub struct Live {
-    /// 最近转写段:(会议相对毫秒, 说话人显示名, 文本),最多保留 200 条
-    pub segments: Vec<(i64, String, String)>,
+    /// 最近转写段:(会议相对毫秒, 说话人显示名, 原文, 译文),最多保留 200 条
+    pub segments: Vec<(i64, String, String, String)>,
     pub started_at_ms: i64,
     pub error: Option<String>,
 }
@@ -27,9 +27,9 @@ fn chrono_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn push_line(live: &SharedLive, rel_ms: i64, speaker: &str, text: &str) {
+pub fn push_line(live: &SharedLive, rel_ms: i64, speaker: &str, text: &str, translation: &str) {
     let mut g = live.lock().expect("live 锁");
-    g.segments.push((rel_ms, speaker.to_string(), text.to_string()));
+    g.segments.push((rel_ms, speaker.to_string(), text.to_string(), translation.to_string()));
     if g.segments.len() > 200 {
             let n = g.segments.len();
         g.segments.drain(..n - 200);
@@ -43,20 +43,20 @@ pub fn show(
     live: &SharedLive,
     cfg: &mrc_core::config::SubtitleCfg,
 ) {
-    let last: Vec<(String, String)> = {
+    let last: Vec<(String, String, String)> = {
         let g = live.lock().expect("live 锁");
         g.segments
             .iter()
             .rev()
             .take(2)
             .rev()
-            .map(|(_, spk, text)| {
+            .map(|(_, spk, text, trn)| {
                 let line = if spk.is_empty() {
                     text.clone()
                 } else {
                     format!("{spk}:{text}")
                 };
-                (spk.clone(), line)
+                (spk.clone(), line, trn.clone())
             })
             .collect()
     };
@@ -72,7 +72,7 @@ pub fn show(
     // 物理像素 → 逻辑(96dpi 基准;主屏缩放非 100% 时由 DPI 感知换算,误差可接受)
     let scale = ctx.pixels_per_point();
     let sub_w = (sw as f32 / scale * 0.72).min(1200.0);
-    let sub_h = cfg.font_size * 2.2 + 60.0;
+    let sub_h = cfg.font_size * 3.6 + 60.0; // 原文+译文 两条的量
     let x = sw as f32 / scale / 2.0 - sub_w / 2.0;
     let y = sh as f32 / scale - cfg.bottom_margin - sub_h;
 
@@ -123,12 +123,25 @@ pub fn show(
                         Color32::from_rgba_unmultiplied(255, 255, 255, 160),
                     );
 
-                    // 字幕两行:上一行淡,当前行亮
+                    // 每条字幕=原文+译文:上一条淡,当前条亮;译文小一号更淡
                     let inner = rect.shrink2(egui::vec2(16.0, 10.0));
-                    let line_h = cfg.font_size + 10.0;
-                    for (i, (_, line)) in last.iter().enumerate() {
-                        let cy = inner.bottom() - (last.len() - 1 - i) as f32 * line_h - line_h / 2.0;
-                        let alpha = if i + 1 == last.len() { 255 } else { 140 };
+                    let line_h = cfg.font_size + 8.0;
+                    let tr_font = FontId::proportional(cfg.font_size * 0.78);
+                    let mut slot = 0f32;
+                    for (i, (_, line, trn)) in last.iter().enumerate().rev() {
+                        let alpha = if i + 1 == last.len() { 255u8 } else { 140 };
+                        if !trn.trim().is_empty() {
+                            let cy = inner.bottom() - slot - line_h * 0.62;
+                            ui.painter().text(
+                                Pos2::new(inner.center().x, cy),
+                                Align2::CENTER_CENTER,
+                                truncate_line(trn, sub_w as usize, cfg.font_size * 0.78),
+                                tr_font.clone(),
+                                Color32::from_rgba_unmultiplied(210, 230, 255, alpha * 3 / 4),
+                            );
+                            slot += line_h * 0.72;
+                        }
+                        let cy = inner.bottom() - slot - line_h / 2.0;
                         ui.painter().text(
                             Pos2::new(inner.center().x, cy),
                             Align2::CENTER_CENTER,
@@ -136,6 +149,7 @@ pub fn show(
                             font.clone(),
                             Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
                         );
+                        slot += line_h;
                     }
                 });
         },
