@@ -7,3 +7,7 @@ packages/
 __pycache__/
 config.toml
 smoke/
+
+# 发布产物(notes 保留)
+dist/rs-meetingrecorder-portable/
+dist/*.zip
