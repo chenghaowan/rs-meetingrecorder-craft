@@ -198,6 +198,8 @@ pub struct TranslateCfg {
     pub wanai_url: String,
     /// 留空 = 网关 default 模型(如 translate-opus-en-zh)
     pub wanai_model: String,
+    /// wanai 翻译执行模式:"local"(opus-mt,快,术语一般) | "api"(网关路由云端 LLM,准,联网)
+    pub wanai_mode: String,
 }
 
 impl Default for TranslateCfg {
@@ -212,6 +214,7 @@ impl Default for TranslateCfg {
             api_url: "https://fanyi-api.baidu.com/api/trans/vip/translate".into(),
             wanai_url: "http://127.0.0.1:17800".into(),
             wanai_model: String::new(),
+            wanai_mode: "local".into(),
         }
     }
 }

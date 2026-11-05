@@ -131,7 +131,9 @@ pub fn encode_wav_16k(samples: &[f32]) -> Vec<u8> {
     out
 }
 
-/// 网关 /asr 执行器(契约:POST 二进制 WAV,响应 JSON segments;网关 M4)。
+/// 网关 /asr 执行器(SenseVoice,网关已就绪)。
+/// 契约:POST /asr?lang=xx,body = WAV 字节(任意采样率,网关混单声道);
+/// 响应 {"text": "...", "language": "..", "timestamps": ..., "ms": n}。
 pub struct RemoteAsr {
     pub gateway_url: String,
     pub language: String,
@@ -178,33 +180,42 @@ impl RemoteAsr {
                 err.get("message").and_then(|m| m.as_str()).unwrap_or("?")
             );
         }
-        let arr = v["segments"]
-            .as_array()
-            .or_else(|| v["data"].as_array())
-            .ok_or_else(|| anyhow::anyhow!("网关响应缺 segments"))?;
-        let mut out = Vec::with_capacity(arr.len());
-        for seg in arr {
-            // start/end 秒或毫秒(>1000 视为毫秒);兼容 start_ms/end_ms 键
-            let get_ms = |a: &serde_json::Value, b: &str, c: &str| -> i64 {
-                if let Some(x) = a[b].as_f64() {
-                    if x > 1000.0 { x as i64 } else { (x * 1000.0) as i64 }
-                } else if let Some(x) = a[c].as_f64() {
-                    if x > 1000.0 { x as i64 } else { (x * 1000.0) as i64 }
-                } else {
-                    0
+        // 网关 v0.1 契约:整段 {text, language, timestamps, ms}(SenseVoice 全文)。
+        // 兼容未来分段形式 {segments:[{start,end,text}]}。
+        let dur_ms = (samples.len() as f64 / TARGET_RATE as f64 * 1000.0) as i64;
+        if let Some(arr) = v["segments"].as_array().or_else(|| v["data"].as_array()) {
+            let mut out = Vec::with_capacity(arr.len());
+            for seg in arr {
+                let get_ms = |a: &serde_json::Value, b: &str, c: &str| -> i64 {
+                    if let Some(x) = a[b].as_f64() {
+                        if x > 1000.0 { x as i64 } else { (x * 1000.0) as i64 }
+                    } else if let Some(x) = a[c].as_f64() {
+                        if x > 1000.0 { x as i64 } else { (x * 1000.0) as i64 }
+                    } else {
+                        0
+                    }
+                };
+                let text = seg["text"].as_str().unwrap_or("").trim().to_string();
+                if text.is_empty() {
+                    continue;
                 }
-            };
-            let text = seg["text"].as_str().unwrap_or("").trim().to_string();
-            if text.is_empty() {
-                continue;
+                out.push(RemoteSegment {
+                    start_ms: get_ms(seg, "start", "start_ms"),
+                    end_ms: get_ms(seg, "end", "end_ms"),
+                    text,
+                });
             }
-            out.push(RemoteSegment {
-                start_ms: get_ms(seg, "start", "start_ms"),
-                end_ms: get_ms(seg, "end", "end_ms"),
-                text,
-            });
+            return Ok(out);
         }
-        Ok(out)
+        let text = v["text"].as_str().unwrap_or("").trim().to_string();
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![RemoteSegment {
+            start_ms: 0,
+            end_ms: dur_ms,
+            text,
+        }])
     }
 }
 

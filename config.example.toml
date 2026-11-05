@@ -2,9 +2,9 @@
 # 全部字段都有默认值;最小可用只需填 [llm].api_key
 
 [whisper]
-# 转写引擎: "local"(whisper-rs 进程内,默认) | "wanai"(网关 /asr,模型归 rs-aiprivaderCraft 管;
-#            网关 M4 就绪前自动回落 local)
-provider = "local"
+# 转写引擎: "wanai"(网关 /asr,SenseVoice,实测 10.8s 音频 0.7s,带标点,模型归网关管,推荐)
+#            | "local"(whisper-rs 进程内,网关不可用时的兜底)
+provider = "wanai"
 gateway_url = "http://127.0.0.1:17800"
 # ggml 模型路径;留空则自动找 cwd/exe 目录 models\*.bin 或数据目录 models\*.bin
 # 下载: python scripts/fetch_whisper.py (hf-mirror 镜像)
@@ -69,9 +69,10 @@ pointtofix_url = ""
 pointtofix_exe = ""
 
 [translate]
-# 字幕实时翻译: "wanai"(本地网关 rs-aiprivaderCraft /translate,opus-mt 本地模型,推荐)
-#              | "llm"(复用 [llm] 云端端点) | "baidu"(百度开放 API) | "none"
-provider = "none"
+# 字幕实时翻译: "wanai"(本地网关 rs-aiprivaderCraft,opus-mt 本地模型,已实测)
+#              | "llm"(复用 [llm] 云端端点,术语更准) | "baidu" | "none"
+# wanai_mode = "api" 可经网关路由云端 LLM 翻译(准,联网)
+provider = "wanai"
 from_lang = "zh"
 to_lang = "en"
 batch_size = 4              # llm provider 每次调用翻译的段数
@@ -79,6 +80,7 @@ batch_size = 4              # llm provider 每次调用翻译的段数
 appid = ""
 secret = ""
 api_url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
-# wanai 本地网关(/translate 为网关 M3,未就绪时自动降级为不翻译)
+# wanai 本地网关(M3 已就绪)
 wanai_url = "http://127.0.0.1:17800"
-wanai_model = ""            # 留空 = 网关 default(translate-opus-en-zh)
+wanai_model = ""            # 留空 = 网关 default
+wanai_mode = "local"        # local(opus-mt,快,离线) | api(网关路由云端 LLM,准)

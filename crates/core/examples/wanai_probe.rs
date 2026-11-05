@@ -1,8 +1,8 @@
 fn main() {
     let cfg = mrc_core::config::TranslateCfg {
         provider: "wanai".into(),
-        from_lang: "en".into(),
-        to_lang: "zh".into(),
+        from_lang: "zh".into(),
+        to_lang: "en".into(),
         ..Default::default()
     };
     let llm = mrc_core::config::LlmCfg::default();

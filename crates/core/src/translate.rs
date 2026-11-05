@@ -157,14 +157,14 @@ impl Translator {
         Ok(values)
     }
 
-    // ---------- wanai provider:本地网关(rs-aiprivaderCraft /translate) ----------
+    // ---------- wanai provider:本地网关(rs-aiprivaderCraft /translate,M3 已就绪) ----------
     //
-    // 契约(与 /embed 同风格,2026-11 与网关侧约定):
+    // 契约(网关 v0.1 实测):
     //   POST {wanai_url}/translate
-    //   {"texts": ["...", ...], "from": "zh", "to": "en", "model": "可选"}
-    //   → {"model": "...", "translations": ["...", ...], "ms": 123}
-    // 网关侧按 from/to 路由 opus-mt 模型(如 translate-opus-en-zh);
-    // /translate 端点为网关 M3,未就绪时本 provider 报错并静默降级(原文照常)。
+    //   {"texts": ["..."], "direction": "en2zh"|"zh2en", "mode": "local|api(可选)", "model": "可选"}
+    //   → {"direction": "...", "via": "...", "results": ["..."], "ms": 123}
+    // local 模式按方向路由 opus-mt(translate-opus-en-zh / translate-opus-zh-en);
+    // 仅支持英<->中,其它方向由 llm/baidu provider 承担。
 
     fn translate_batch_wanai(
         &self,
@@ -173,10 +173,16 @@ impl Translator {
     ) -> Result<Vec<Option<String>>> {
         let payload_texts: Vec<&str> = idxs.iter().map(|i| texts[*i].as_str()).collect();
         let url = format!("{}/translate", self.cfg.wanai_url.trim_end_matches('/'));
+        // 网关契约:direction = en2zh | zh2en(opus-mt 按方向分模型)
+        let direction = match (self.cfg.from_lang.as_str(), self.cfg.to_lang.as_str()) {
+            ("en", "zh") => "en2zh",
+            ("zh", "en") => "zh2en",
+            (f, t) => bail!("wanai 网关仅支持 en<->zh,当前 {}->{}(该方向请用 llm/baidu)", f, t),
+        };
         let mut body = json!({
             "texts": payload_texts,
-            "from": self.cfg.from_lang,
-            "to": self.cfg.to_lang,
+            "direction": direction,
+            "mode": if self.cfg.wanai_mode.trim() == "api" { "api" } else { "local" },
         });
         if !self.cfg.wanai_model.trim().is_empty() {
             body["model"] = json!(self.cfg.wanai_model.trim());
