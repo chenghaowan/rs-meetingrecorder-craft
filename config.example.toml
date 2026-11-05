@@ -65,7 +65,8 @@ pointtofix_url = ""
 pointtofix_exe = ""
 
 [translate]
-# 字幕实时翻译: "llm"(复用 [llm] 端点,rs-aiprivaderCraft 网关就位后指向它) | "baidu" | "none"
+# 字幕实时翻译: "wanai"(本地网关 rs-aiprivaderCraft /translate,opus-mt 本地模型,推荐)
+#              | "llm"(复用 [llm] 云端端点) | "baidu"(百度开放 API) | "none"
 provider = "none"
 from_lang = "zh"
 to_lang = "en"
@@ -74,3 +75,6 @@ batch_size = 4              # llm provider 每次调用翻译的段数
 appid = ""
 secret = ""
 api_url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+# wanai 本地网关(/translate 为网关 M3,未就绪时自动降级为不翻译)
+wanai_url = "http://127.0.0.1:17800"
+wanai_model = ""            # 留空 = 网关 default(translate-opus-en-zh)

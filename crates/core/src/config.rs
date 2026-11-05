@@ -184,6 +184,10 @@ pub struct TranslateCfg {
     pub appid: String,
     pub secret: String,
     pub api_url: String,
+    /// wanai 本地网关(rs-aiprivaderCraft /translate,opus-mt 本地 ONNX)
+    pub wanai_url: String,
+    /// 留空 = 网关 default 模型(如 translate-opus-en-zh)
+    pub wanai_model: String,
 }
 
 impl Default for TranslateCfg {
@@ -196,6 +200,8 @@ impl Default for TranslateCfg {
             appid: String::new(),
             secret: String::new(),
             api_url: "https://fanyi-api.baidu.com/api/trans/vip/translate".into(),
+            wanai_url: "http://127.0.0.1:17800".into(),
+            wanai_model: String::new(),
         }
     }
 }

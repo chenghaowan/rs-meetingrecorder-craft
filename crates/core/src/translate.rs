@@ -37,6 +37,11 @@ impl Translator {
                     bail!("provider=baidu 但 [translate] appid/secret 未配置");
                 }
             }
+            "wanai" => {
+                if cfg.wanai_url.trim().is_empty() {
+                    bail!("provider=wanai 但 [translate] wanai_url 未配置");
+                }
+            }
             other => bail!("未知翻译 provider: {other}(llm/baidu/none)"),
         }
         Ok(Self {
@@ -81,6 +86,7 @@ impl Translator {
         // 2) 未命中的按 provider 翻
         let res = match self.cfg.provider.as_str() {
             "baidu" => self.translate_batch_baidu(texts, &pending),
+            "wanai" => self.translate_batch_wanai(texts, &pending),
             _ => self.translate_batch_llm(texts, &pending),
         };
         if let Ok(values) = res {
@@ -147,6 +153,58 @@ impl Translator {
                 }
                 Err(e) => eprintln!("[translate] llm 批次失败: {e}"),
             }
+        }
+        Ok(values)
+    }
+
+    // ---------- wanai provider:本地网关(rs-aiprivaderCraft /translate) ----------
+    //
+    // 契约(与 /embed 同风格,2026-11 与网关侧约定):
+    //   POST {wanai_url}/translate
+    //   {"texts": ["...", ...], "from": "zh", "to": "en", "model": "可选"}
+    //   → {"model": "...", "translations": ["...", ...], "ms": 123}
+    // 网关侧按 from/to 路由 opus-mt 模型(如 translate-opus-en-zh);
+    // /translate 端点为网关 M3,未就绪时本 provider 报错并静默降级(原文照常)。
+
+    fn translate_batch_wanai(
+        &self,
+        texts: &[String],
+        idxs: &[usize],
+    ) -> Result<Vec<Option<String>>> {
+        let payload_texts: Vec<&str> = idxs.iter().map(|i| texts[*i].as_str()).collect();
+        let url = format!("{}/translate", self.cfg.wanai_url.trim_end_matches('/'));
+        let mut body = json!({
+            "texts": payload_texts,
+            "from": self.cfg.from_lang,
+            "to": self.cfg.to_lang,
+        });
+        if !self.cfg.wanai_model.trim().is_empty() {
+            body["model"] = json!(self.cfg.wanai_model.trim());
+        }
+        let resp = self
+            .agent
+            .post(&url)
+            .send_json(&body)
+            .map_err(|e| anyhow!("本地网关 {url} 不可用: {e}"))?;
+        let v: serde_json::Value = resp.into_json().context("网关响应解析失败")?;
+        if let Some(err) = v["error"].as_object() {
+            bail!(
+                "网关错误 [{}]: {}",
+                err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown"),
+                err.get("message").and_then(|m| m.as_str()).unwrap_or("?")
+            );
+        }
+        // 兼容键名:translations / results / data
+        let arr = v["translations"]
+            .as_array()
+            .or_else(|| v["results"].as_array())
+            .or_else(|| v["data"].as_array());
+        let Some(arr) = arr else {
+            bail!("网关响应缺 translations: {}", truncate_json(&v));
+        };
+        let mut values: Vec<Option<String>> = Vec::with_capacity(idxs.len());
+        for k in 0..idxs.len() {
+            values.push(arr.get(k).and_then(|x| x.as_str()).map(|s| s.to_string()));
         }
         Ok(values)
     }
@@ -240,6 +298,11 @@ pub fn chat_text(llm: &LlmCfg, agent: &ureq::Agent, system: &str, user: &str) ->
         .as_str()
         .map(|s| s.trim().to_string())
         .ok_or_else(|| anyhow!("LLM 响应缺 content"))
+}
+
+fn truncate_json(v: &serde_json::Value) -> String {
+    let t = v.to_string();
+    t.chars().take(160).collect()
 }
 
 fn lang_name(code: &str) -> &'static str {

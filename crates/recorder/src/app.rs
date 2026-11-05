@@ -145,6 +145,7 @@ struct Draft {
     tr_to: String,
     tr_appid: String,
     tr_secret: String,
+    tr_wanai_url: String,
     shots_default_win: String,
     shots_auto: String,
 }
@@ -180,6 +181,7 @@ impl Draft {
             tr_to: c.translate.to_lang.clone(),
             tr_appid: c.translate.appid.clone(),
             tr_secret: c.translate.secret.clone(),
+            tr_wanai_url: c.translate.wanai_url.clone(),
             shots_default_win: c.shots.default_window.clone(),
             shots_auto: c.shots.auto_window_secs.to_string(),
         }
@@ -217,8 +219,13 @@ impl Draft {
         c.lang = Some(self.lang_code.clone()).filter(|s| !s.is_empty());
         let prov = self.tr_provider.trim();
         c.translate.provider = match prov {
-            "llm" | "baidu" => prov.to_string(),
+            "llm" | "baidu" | "wanai" => prov.to_string(),
             _ => "none".to_string(),
+        };
+        c.translate.wanai_url = if self.tr_wanai_url.trim().is_empty() {
+            "http://127.0.0.1:17800".into()
+        } else {
+            self.tr_wanai_url.trim().into()
         };
         c.translate.from_lang = if self.tr_from.trim().is_empty() { "zh".into() } else { self.tr_from.trim().into() };
         c.translate.to_lang = if self.tr_to.trim().is_empty() { "en".into() } else { self.tr_to.trim().into() };
@@ -1010,19 +1017,26 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                         .selected_text(match prov.as_str() {
                             "llm" => "LLM",
                             "baidu" => "Baidu",
+                            "wanai" => "WanAI (local)",
                             _ => "off",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut prov, "none".to_string(), "off");
                             ui.selectable_value(&mut prov, "llm".to_string(), "LLM");
                             ui.selectable_value(&mut prov, "baidu".to_string(), "Baidu");
+                            ui.selectable_value(&mut prov, "wanai".to_string(), "WanAI (local)");
                         });
                     d.tr_provider = prov;
                 });
                 row(ui, tr.lbl_tr_from, &mut d.tr_from, "zh");
                 row(ui, tr.lbl_tr_to, &mut d.tr_to, "en");
-                row(ui, tr.lbl_tr_appid, &mut d.tr_appid, "");
-                row(ui, tr.lbl_tr_secret, &mut d.tr_secret, "");
+                if d.tr_provider == "wanai" {
+                    row(ui, tr.lbl_wanai_url, &mut d.tr_wanai_url, tr.hint_wanai_url);
+                }
+                if d.tr_provider == "baidu" {
+                    row(ui, tr.lbl_tr_appid, &mut d.tr_appid, "");
+                    row(ui, tr.lbl_tr_secret, &mut d.tr_secret, "");
+                }
                 ui.separator();
                 ui.heading(tr.sec_shots);
                 row(ui, tr.lbl_shots_default, &mut d.shots_default_win, tr.hint_shots_default);

@@ -104,6 +104,8 @@ mrc-postprocess rag 3              # retry RAG ingestion
 An AI-agent skill (`.agents/skills/meetingrecord`) documents the database/package contracts for automated retrieval.
 
 ## Live translation & window capture
+- **Local model translation** (`provider = "wanai"`): routes to the WanAI Runtime gateway (`rs-aiprivaderCraft`, `http://127.0.0.1:17800`) whose `/translate` serves a local opus-mt ONNX model - fully offline. Until the gateway ships its M3 translate endpoint, this provider silently degrades to no-translation. `provider = "llm"` remains the cloud alternative.
+
 
 - **Live subtitle translation** (`[translate]`): `provider = "llm"` reuses the `[llm]` OpenAI-compatible endpoint (zero-code switch once the unified model gateway rs-aiprivaderCraft is up); `"baidu"` uses the Baidu Translate Open API (same appid/secret as ltl-manage); `"none"` disables. LLM mode batches 3-5 lines per call and keeps engineering terms; translations land in `segments.translation`, the second subtitle line, and `transcript.json`.
 - **Window capture**: a window-title keyword is resolved to the exact visible rect (DWM frame bounds) and shot through pointtofixcraft's headless `--capture`. Three entry points: CLI `mrc-recorder --shot-window Teams [--shot-window-ocr]`; the 📷 button on the panel while recording; `auto_window_secs` periodic auto-shots. Occluded/minimized windows capture whatever is on screen in that region (inherent to region capture); per-window content capture is planned.
