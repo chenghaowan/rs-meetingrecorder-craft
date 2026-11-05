@@ -38,6 +38,14 @@ fn main() -> eframe::Result<()> {
     }
 
     let cfg = mrc_core::config::Config::load().unwrap_or_default();
+    // 网关后台预热(不阻塞 GUI;开始会议前还有一次同步 ensure 兜底)
+    {
+        let cfg2 = cfg.clone();
+        std::thread::spawn(move || match mrc_core::gateway::ensure(&cfg2) {
+            Ok(msg) => eprintln!("[gateway] {msg}"),
+            Err(e) => eprintln!("[gateway] 未就绪(转写/翻译将不可用): {e:#}"),
+        });
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("会议记录")

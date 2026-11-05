@@ -21,10 +21,20 @@ pub struct Translator {
     llm: Option<LlmCfg>,
     agent: ureq::Agent,
     cache: Mutex<HashMap<String, String>>,
+    wanai_url: String,
 }
 
 impl Translator {
     pub fn new(cfg: &TranslateCfg, llm: &LlmCfg) -> Result<Self> {
+        Self::with_gateway(cfg, llm, None)
+    }
+
+    /// gateway_url: [gateway].url 统一入口(None = 用 cfg.wanai_url)
+    pub fn with_gateway(
+        cfg: &TranslateCfg,
+        llm: &LlmCfg,
+        cfg_wanai_url: Option<&str>,
+    ) -> Result<Self> {
         match cfg.provider.as_str() {
             "none" | "" => bail!("翻译未启用"),
             "llm" => {
@@ -38,8 +48,8 @@ impl Translator {
                 }
             }
             "wanai" => {
-                if cfg.wanai_url.trim().is_empty() {
-                    bail!("provider=wanai 但 [translate] wanai_url 未配置");
+                if cfg.wanai_url.trim().is_empty() && cfg_wanai_url.is_none() {
+                    bail!("provider=wanai 但网关地址未配置");
                 }
             }
             other => bail!("未知翻译 provider: {other}(llm/baidu/none)"),
@@ -51,6 +61,10 @@ impl Translator {
                 .timeout(std::time::Duration::from_secs(30))
                 .build(),
             cache: Mutex::new(HashMap::new()),
+            wanai_url: cfg_wanai_url
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| cfg.wanai_url.trim().to_string()),
         })
     }
 
@@ -172,7 +186,7 @@ impl Translator {
         idxs: &[usize],
     ) -> Result<Vec<Option<String>>> {
         let payload_texts: Vec<&str> = idxs.iter().map(|i| texts[*i].as_str()).collect();
-        let url = format!("{}/translate", self.cfg.wanai_url.trim_end_matches('/'));
+        let url = format!("{}/translate", self.wanai_url);
         // 网关契约:direction = en2zh | zh2en(opus-mt 按方向分模型)
         let direction = match (self.cfg.from_lang.as_str(), self.cfg.to_lang.as_str()) {
             ("en", "zh") => "en2zh",

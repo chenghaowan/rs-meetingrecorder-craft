@@ -122,6 +122,13 @@ fn cmd_run(cfg: &Config, args: &[String]) -> Result<()> {
     let spec = spec.context("缺会议 id(数字或 last)")?;
     let conn = db::open(&cfg.db_path())?;
     let id = resolve_meeting(&conn, &spec)?;
+    // 翻译走网关时兜底就绪
+    if cfg.translate.provider == "wanai" {
+        match mrc_core::gateway::ensure(cfg) {
+            Ok(msg) => println!("[gateway] {msg}"),
+            Err(e) => println!("[gateway] 未就绪(翻译将跳过): {e:#}"),
+        }
+    }
     match pipeline::run(cfg, &mut db::open(&cfg.db_path())?, id, interactive, skip_llm, skip_rag) {
         Ok(r) => println!("{r}"),
         Err((_, Some(pipeline::PipelineStop::NamingNeeded(keys)))) => {

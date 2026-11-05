@@ -179,7 +179,7 @@ pub fn run(
                 .map(|s| s.idx)
                 .collect();
             if !untranslated.is_empty() {
-                match Translator::new(&cfg.translate, &cfg.llm) {
+                match Translator::with_gateway(&cfg.translate, &cfg.llm, Some(&cfg.gateway_url())) {
                     Ok(tr) if tr.enabled() => {
                         let texts: Vec<String> = segs
                             .iter()

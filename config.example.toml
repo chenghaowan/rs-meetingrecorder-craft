@@ -1,6 +1,15 @@
 # ltl-meetingrecordCraft 配置(%APPDATA%\ltl-meetingrecord\config.toml)
 # 全部字段都有默认值;最小可用只需填 [llm].api_key
 
+
+# ── wanai 网关(必要软件:转写/翻译引擎的宿主)──
+# ensure 三段式: /health 探测 → 本地 exe 自动拉起 → gh release 下载启动
+# (模型由网关按 config.yaml 声明自动下载;本项目不管理任何模型文件)
+[gateway]
+url = "http://127.0.0.1:17800"
+auto_start = true
+exe_path = ""              # 本地 exe 覆盖;留空自动探测(tools → 兄弟仓库)
+
 [whisper]
 # 转写引擎: "wanai"(网关 /asr,SenseVoice,实测 10.8s 音频 0.7s,带标点,模型归网关管,推荐)
 #            | "local"(whisper-rs 进程内,网关不可用时的兜底)

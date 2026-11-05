@@ -33,6 +33,8 @@ pub enum CliAction {
     /// 工具子命令(安装/启动 pointtofixcraft)
     ToolInstall { src: Option<String> },
     ToolLaunch,
+    /// 网关确保就绪(status 只看,start 会拉起/下载)
+    GatewayStart,
     /// 指定窗口截图(经 pointtofixcraft 落库)
     ShotWindow { keyword: String, ocr: bool },
     /// 无头转写一个 WAV(完全本地),stdout 输出 JSON 段落
@@ -57,6 +59,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliAction {
                 return CliAction::ToolInstall { src: args.get(i).cloned() };
             }
             "--tool-launch" => return CliAction::ToolLaunch,
+            "--gateway" => return CliAction::GatewayStart,
             "--transcribe" => {
                 i += 1;
                 let wav = args.get(i).cloned()
@@ -136,6 +139,16 @@ pub fn run(action: CliAction) -> i32 {
                 1
             }
         },
+        CliAction::GatewayStart => match mrc_core::gateway::ensure(&cfg) {
+            Ok(msg) => {
+                println!("gateway: {msg}");
+                0
+            }
+            Err(e) => {
+                eprintln!("错误: {e:#}");
+                1
+            }
+        },
         CliAction::ShotWindow { keyword, ocr } => match shot_window(&cfg, &keyword, ocr) {
             Ok(v) => {
                 println!("{v}");
@@ -150,6 +163,7 @@ pub fn run(action: CliAction) -> i32 {
             eprintln!("参数错误: {msg}");
             eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --shot-window 关键词 [--shot-window-ocr] | --transcribe <wav> [--model 路径]]");
     eprintln!("  [whisper] provider = local(默认,进程内) | wanai(网关 /asr,未就绪回落 local)");
+    eprintln!("  --gateway          确保网关就绪(健康检查→本地启动→release 下载)");
             2
         }
         CliAction::Gui => 0,
@@ -158,6 +172,9 @@ pub fn run(action: CliAction) -> i32 {
 
 fn cmd_transcribe(cfg: &Config, wav: &str, model: Option<&str>) -> Result<serde_json::Value> {
     use mrc_core::transcribe::{load_wav_16k, RemoteAsr, Streaming, Transcriber};
+    if cfg.whisper.provider == "wanai" {
+        let _ = mrc_core::gateway::ensure(cfg);
+    }
     let path = std::path::Path::new(wav);
     let model_path = model
         .map(std::path::PathBuf::from)
@@ -244,6 +261,13 @@ fn cmd_status(cfg: &Config) -> i32 {
 
 /// 无头录音:回车 / Ctrl+C 结束 → 后处理(控制台交互命名)→ JSON 回执
 fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
+    // 网关兜底(provider=wanai 时)
+    if cfg.whisper.provider == "wanai" || cfg.translate.provider == "wanai" {
+        match mrc_core::gateway::ensure(cfg) {
+            Ok(msg) => eprintln!("[gateway] {msg}"),
+            Err(e) => eprintln!("[gateway] 未就绪: {e:#}"),
+        }
+    }
     let now = db::now_ms();
     let title = title
         .map(|s| s.to_string())
@@ -260,7 +284,7 @@ fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
     let (done_tx, done_rx) = mpsc::channel::<Result<()>>();
     let cfg2 = cfg.clone();
     let shared2 = shared.clone();
-    let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+    let translator = Translator::with_gateway(&cfg2.translate, &cfg2.llm, Some(&cfg2.gateway_url())).ok();
     let remote_asr = if cfg2.whisper.provider == "wanai" {
         Some(RemoteAsr::new(&cfg2.whisper.gateway_url, &cfg2.whisper.language))
     } else {

@@ -60,6 +60,8 @@ F8 screenshot → gallery.db            Ingest into RAG
 - **i18n**: 中文 / English / Deutsch / 日本語, following the system UI language on first start; switchable in Settings.
 - **Headless CLI** for scripts and AI agents (`--start`, `--status`, `--tool-install`, `--tool-launch`), plus a `mrc-postprocess` CLI for re-running the pipeline.
 
+- **Gateway as required software** (`[gateway]`): STT/translation engines live in the WanAI Runtime gateway. On startup and before every meeting: `/health` probe → if down, auto-start a locally detected exe → if none, `gh release download` the portable zip from the gateway repo (private-repo auth handled by gh CLI) and start it. Models (SenseVoice/opus-mt/BGE) download themselves inside the gateway; this repo ships no model files.
+
 ## Requirements
 
 - Windows 10/11 x64

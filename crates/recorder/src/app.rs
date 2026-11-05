@@ -147,7 +147,8 @@ struct Draft {
     tr_to: String,
     tr_appid: String,
     tr_secret: String,
-    tr_wanai_url: String,
+    gw_url: String,
+    gw_auto_start: bool,
     shots_default_win: String,
     shots_auto: String,
 }
@@ -185,7 +186,8 @@ impl Draft {
             tr_to: c.translate.to_lang.clone(),
             tr_appid: c.translate.appid.clone(),
             tr_secret: c.translate.secret.clone(),
-            tr_wanai_url: c.translate.wanai_url.clone(),
+            gw_url: c.gateway.url.clone(),
+            gw_auto_start: c.gateway.auto_start,
             shots_default_win: c.shots.default_window.clone(),
             shots_auto: c.shots.auto_window_secs.to_string(),
         }
@@ -236,11 +238,15 @@ impl Draft {
             "llm" | "baidu" | "wanai" => prov.to_string(),
             _ => "none".to_string(),
         };
-        c.translate.wanai_url = if self.tr_wanai_url.trim().is_empty() {
+        c.gateway.url = if self.gw_url.trim().is_empty() {
             "http://127.0.0.1:17800".into()
         } else {
-            self.tr_wanai_url.trim().into()
+            self.gw_url.trim().into()
         };
+        c.gateway.auto_start = self.gw_auto_start;
+        // 旧字段同步(兼容回退读取)
+        c.translate.wanai_url = c.gateway.url.clone();
+        c.whisper.gateway_url = c.gateway.url.clone();
         c.translate.from_lang = if self.tr_from.trim().is_empty() { "zh".into() } else { self.tr_from.trim().into() };
         c.translate.to_lang = if self.tr_to.trim().is_empty() { "en".into() } else { self.tr_to.trim().into() };
         c.translate.appid = self.tr_appid.trim().to_string();
@@ -352,6 +358,13 @@ impl App {
     }
 
     fn try_start_meeting(&mut self) -> Result<()> {
+        // 网关兜底(后台预热可能还没完成/失败):阻塞至多 30s,换取会议全程可用
+        if self.cfg.whisper.provider == "wanai" || self.cfg.translate.provider == "wanai" {
+            match mrc_core::gateway::ensure(&self.cfg) {
+                Ok(msg) => self.notice = Some((false, format!("网关: {msg}"))),
+                Err(e) => self.notice = Some((true, format!("网关未就绪: {e:#}"))),
+            }
+        }
         let now = db::now_ms();
         let title = format!("{} {}", self.lang.strings().app_title, db::fmt_local(now));
         let meeting_id = db::insert_meeting(&self.conn, &title, now)?;
@@ -371,7 +384,7 @@ impl App {
         let cfg2 = self.cfg.clone();
         let live2 = std::sync::Arc::clone(&self.live);
         let shared2 = shared.clone();
-        let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+        let translator = Translator::with_gateway(&cfg2.translate, &cfg2.llm, Some(&cfg2.gateway_url())).ok();
         let remote_asr = if cfg2.whisper.provider == "wanai" {
             Some(RemoteAsr::new(&cfg2.whisper.gateway_url, &cfg2.whisper.language))
         } else {
@@ -998,6 +1011,27 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
         .show(ctx, |ui| {
             let Some(d) = app.draft.as_mut() else { return };
             ScrollArea::vertical().max_height(430.0).show(ui, |ui| {
+                ui.heading(tr.sec_gateway);
+                let gw_alive = mrc_core::gateway::health(&app.cfg.gateway_url(), std::time::Duration::from_millis(800));
+                ui.label(
+                    RichText::new(if gw_alive { tr.gateway_online } else { tr.gateway_offline })
+                        .size(12.0)
+                        .color(if gw_alive { Color32::from_rgb(140, 200, 160) } else { Color32::from_rgb(240, 160, 90) }),
+                );
+                row(ui, tr.lbl_gateway_url, &mut d.gw_url, tr.hint_gateway_url);
+                ui.checkbox(&mut d.gw_auto_start, tr.lbl_gw_auto_start);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(tr.btn_gateway_start)).clicked() {
+                        let cfg = app.cfg.clone();
+                        std::thread::spawn(move || {
+                            match mrc_core::gateway::ensure(&cfg) {
+                                Ok(msg) => println!("[gateway] {msg}"),
+                                Err(e) => eprintln!("[gateway] {e:#}"),
+                            }
+                        });
+                    }
+                });
+                ui.separator();
                 ui.heading(tr.sec_whisper);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(tr.lbl_stt_provider).size(12.5));
@@ -1013,9 +1047,6 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                         });
                     d.whisper_provider = prov;
                 });
-                if d.whisper_provider == "wanai" {
-                    row(ui, tr.lbl_wanai_url, &mut d.whisper_gateway, tr.hint_wanai_url);
-                }
                 row(ui, tr.lbl_model, &mut d.whisper_model, tr.hint_model);
                 row(ui, tr.lbl_language, &mut d.whisper_lang, "zh / en / auto");
                 row(ui, tr.lbl_window, &mut d.whisper_window, "12");
@@ -1067,9 +1098,6 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                 });
                 row(ui, tr.lbl_tr_from, &mut d.tr_from, "zh");
                 row(ui, tr.lbl_tr_to, &mut d.tr_to, "en");
-                if d.tr_provider == "wanai" {
-                    row(ui, tr.lbl_wanai_url, &mut d.tr_wanai_url, tr.hint_wanai_url);
-                }
                 if d.tr_provider == "baidu" {
                     row(ui, tr.lbl_tr_appid, &mut d.tr_appid, "");
                     row(ui, tr.lbl_tr_secret, &mut d.tr_secret, "");

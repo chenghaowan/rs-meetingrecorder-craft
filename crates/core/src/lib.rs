@@ -10,6 +10,7 @@ pub mod chunk;
 pub mod config;
 pub mod db;
 pub mod diarize;
+pub mod gateway;
 pub mod llm;
 pub mod package;
 pub mod pipeline;

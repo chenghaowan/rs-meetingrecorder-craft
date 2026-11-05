@@ -174,6 +174,8 @@ pub struct Config {
     pub lang: Option<String>,
     /// 字幕实时翻译
     pub translate: TranslateCfg,
+    /// wanai 网关(必要软件:统一地址/自动启动/release 下载)
+    pub gateway: GatewayCfg,
     /// 底部字幕条
     pub subtitle: SubtitleCfg,
     /// 外部工具(pointtofixcraft 截图)
@@ -215,6 +217,31 @@ impl Default for TranslateCfg {
             wanai_url: "http://127.0.0.1:17800".into(),
             wanai_model: String::new(),
             wanai_mode: "local".into(),
+        }
+    }
+}
+
+/// wanai 网关配置(地址统一从这里取;whisper/translate 段的旧 url 字段仅兼容读取)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayCfg {
+    pub url: String,
+    /// 未启动时自动探测本地 exe / 下载 release 启动
+    pub auto_start: bool,
+    /// 本地 exe 覆盖;留空自动探测
+    pub exe_path: Option<PathBuf>,
+    /// 关闭兄弟仓库开发版探测(默认 false;测试 release 下载路径用)
+    #[serde(default)]
+    pub dev_probe_disabled: bool,
+}
+
+impl Default for GatewayCfg {
+    fn default() -> Self {
+        Self {
+            url: "http://127.0.0.1:17800".into(),
+            auto_start: true,
+            exe_path: None,
+            dev_probe_disabled: false,
         }
     }
 }
@@ -310,6 +337,7 @@ impl Default for Config {
             subtitle: SubtitleCfg::default(),
             tools: ToolsCfg::default(),
             translate: TranslateCfg::default(),
+            gateway: GatewayCfg::default(),
         }
     }
 }
@@ -364,6 +392,20 @@ impl Config {
         self.audio_dir
             .clone()
             .unwrap_or_else(|| self.data_dir().join("audio"))
+    }
+
+    /// 网关地址统一入口([gateway].url;缺省回退旧字段保持兼容)
+    pub fn gateway_url(&self) -> String {
+        if !self.gateway.url.trim().is_empty() {
+            return self.gateway.url.trim().trim_end_matches('/').to_string();
+        }
+        if self.whisper.provider == "wanai" && !self.whisper.gateway_url.trim().is_empty() {
+            return self.whisper.gateway_url.trim().to_string();
+        }
+        if !self.translate.wanai_url.trim().is_empty() {
+            return self.translate.wanai_url.trim().to_string();
+        }
+        "http://127.0.0.1:17800".into()
     }
 
     pub fn packages_dir(&self) -> PathBuf {
