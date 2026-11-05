@@ -20,6 +20,7 @@ use crate::package::{self, PackageInput};
 use crate::rag::{self, RagClient};
 use crate::shots;
 use crate::tokens::approx_tokens;
+use crate::translate::Translator;
 
 pub enum PipelineStop {
     /// 有说话人簇未命名(非交互模式),带未命名 key 列表
@@ -170,6 +171,36 @@ pub fn run(
                 ));
             }
         }
+        // ---- 2.5 翻译补齐:录音时没翻成的(服务挂/离线导入)在这里补 ----
+        {
+            let untranslated: Vec<i64> = segs
+                .iter()
+                .filter(|s| s.translation.trim().is_empty())
+                .map(|s| s.idx)
+                .collect();
+            if !untranslated.is_empty() {
+                match Translator::new(&cfg.translate, &cfg.llm) {
+                    Ok(tr) if tr.enabled() => {
+                        let texts: Vec<String> = segs
+                            .iter()
+                            .filter(|s| s.translation.trim().is_empty())
+                            .map(|s| s.text.clone())
+                            .collect();
+                        let outs = tr.translate_batch(&texts);
+                        for (k, o) in outs.iter().enumerate() {
+                            if let Some(v) = o {
+                                let _ = db::update_translation(conn, untranslated[k], meeting_id, v);
+                            }
+                        }
+                        let done = outs.iter().filter(|o| o.is_some()).count();
+                        eprintln!("[pipeline] 翻译补齐 {}/{} 段", done, untranslated.len());
+                        segs = db::load_segments(conn, meeting_id)?;
+                    }
+                    _ => eprintln!("[pipeline] 翻译未启用/未配置,跳过补齐"),
+                }
+            }
+        }
+
         // 展示段:名字已命名的用名字,未命名的保留簇键(簇键永不覆写)
         let segs_named = db::load_segments_named(conn, meeting_id)?;
 
