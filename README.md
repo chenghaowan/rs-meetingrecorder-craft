@@ -93,6 +93,7 @@ mrc-recorder --status              # last 10 meetings + screenshot tool location
 mrc-recorder --tool-install [src]  # install/update PointToFix Craft (URL or local path)
 mrc-recorder --tool-launch         # launch the screenshot tool
 
+mrc-recorder --transcribe <wav>        # headless offline transcription, JSON segments out
 mrc-postprocess list               # meeting list
 mrc-postprocess run last           # (re-)run post-processing; interactive naming
 mrc-postprocess run 3 --no-llm     # rebuild package without LLM

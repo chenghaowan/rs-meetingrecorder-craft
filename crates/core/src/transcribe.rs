@@ -6,7 +6,7 @@
 //!
 //! 特性开关:whisper feature 关闭时此处编译为空实现,采集/归档照常。
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 #[cfg(feature = "whisper")]
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -105,6 +105,54 @@ impl Transcriber {
     pub fn decode(&self, _samples: &[f32], _off_ms: i64) -> Result<Vec<RawSegment>> {
         Err(anyhow::anyhow!("编译未启用 whisper feature,转写不可用"))
     }
+}
+
+/// 读取任意 WAV,重采样为 16k mono f32(离线转写用)。
+pub fn load_wav_16k(path: &std::path::Path) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)
+        .with_context(|| format!("打开 WAV 失败: {}", path.display()))?;
+    let spec = reader.spec();
+    let ch = spec.channels as usize;
+    let src_rate = spec.sample_rate as f64;
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => match spec.bits_per_sample {
+            16 => reader
+                .samples::<i16>()
+                .map(|s| Ok(s? as f32 / 32768.0))
+                .collect::<std::result::Result<Vec<_>, anyhow::Error>>()?,
+            32 => reader
+                .samples::<i32>()
+                .map(|s| Ok(s? as f32 / 2147483648.0))
+                .collect::<std::result::Result<Vec<_>, anyhow::Error>>()?,
+            b => bail!("不支持的位深: {b}"),
+        },
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|s| Ok(s?))
+            .collect::<std::result::Result<Vec<_>, anyhow::Error>>()?,
+    };
+    // 混单声道
+    let mono: Vec<f32> = if ch <= 1 {
+        raw
+    } else {
+        raw.chunks(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect()
+    };
+    // 线性重采样到 16k
+    if (src_rate - TARGET_RATE as f64).abs() < 1.0 {
+        return Ok(mono);
+    }
+    let ratio = src_rate / TARGET_RATE as f64;
+    let out_len = (mono.len() as f64 / ratio) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let pos = i as f64 * ratio;
+        let i0 = pos as usize;
+        let frac = (pos - i0 as f64) as f32;
+        let s0 = mono.get(i0).copied().unwrap_or(0.0);
+        let s1 = mono.get(i0 + 1).copied().unwrap_or(s0);
+        out.push(s0 + (s1 - s0) * frac);
+    }
+    Ok(out)
 }
 
 /// 流式解码循环状态机:供解码线程每 tick 调用。

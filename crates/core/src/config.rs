@@ -364,7 +364,10 @@ impl Config {
                 return Some(p.clone());
             }
         }
-        let mut roots = vec![std::env::current_exe().ok()?.parent()?.to_path_buf()];
+        let mut roots = vec![];
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(p) = exe.parent().map(|p| p.to_path_buf()) {
                 roots.push(p);
@@ -381,7 +384,14 @@ impl Config {
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|e| e == "bin"))
                 .collect();
-            bins.sort();
+            // 多个模型并存时按质量优先:small > base > tiny > medium > 其它
+            let rank = |p: &std::path::Path| -> usize {
+                let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                if n.contains("small") { 0 } else if n.contains("base") { 1 }
+                else if n.contains("tiny") { 2 } else if n.contains("medium") { 3 }
+                else { 4 }
+            };
+            bins.sort_by_key(|p| rank(p));
             if let Some(p) = bins.into_iter().next() {
                 return Some(p);
             }

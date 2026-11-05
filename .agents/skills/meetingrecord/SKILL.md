@@ -30,6 +30,12 @@ mrc-recorder --start [--title "DFM评审"]   # 无 GUI 录音,回车/Ctrl+C 结�
 mrc-recorder --status                      # 最近 10 场会议 + pointtofix 位置(JSON)
 mrc-recorder --tool-install [URL|路径]     # 安装/更新 pointtofixcraft(截图工具)
 mrc-recorder --tool-launch                 # 启动截图工具
+mrc-recorder --shot-window 关键词 [--shot-window-ocr]
+                                           # 指定窗口截图:标题关键词→DWM 精确矩形→
+                                           # pointtofixcraft 落库,JSON 回执(shot_id/file/ocr)
+mrc-recorder --transcribe <wav> [--model 路径]
+                                           # 无头离线转写(whisper 本地),JSON 段落回执
+                                           # 含 duration_s/elapsed_s;任意采样率单/双声道皆可
 ```
 
 `--start` 回执示例:
@@ -55,6 +61,12 @@ cat "$(cygpath "$APPDATA")/ltl-meetingrecord/packages/<最新目录>/actions.jso
 ```
 再要原文溯源 → `transcript.json` 按 `evidence_time` 找段落。
 
+**离线转写任意录音**(比如用户丢来一段会议录音要纪要):
+```bash
+mrc-recorder --transcribe recording.wav          # JSON: {segments:[{start_ms,end_ms,text}]}
+```
+拿转写文本再去喂 [llm] 做纪要。
+
 **全库检索**:meetings.db 无 FTS,直接 SQL:
 ```sql
 SELECT m.id, m.title, m.started_at FROM meetings m WHERE m.status='done';
@@ -65,7 +77,8 @@ SELECT text FROM segments WHERE meeting_id=3 AND text LIKE '%偷胶%';
 
 ## 4. 注意
 
-- 转写需 whisper ggml 模型(config.toml `[whisper] model_path` 或 `models\*.bin`);缺失时只录音归档,会后可用 `postprocess` 不补转写(模型补上后重新录才有效)
+- 转写完全本地(whisper.cpp):模型 `models\ggml-small.bin`(465MB,缺则 `python scripts/fetch_whisper.py`);多模型并存按 small>base>tiny 优先自动选;输出简体中文
+- 字幕实时翻译(`[translate]`):`provider = "wanai"` 走本地网关 rs-aiprivaderCraft(opus-mt,127.0.0.1:17800,网关 M3 前自动降级不翻);`"llm"` 复用 [llm] 云端;`"baidu"` 百度 API。译文在 `segments.translation`/字幕条第二行/transcript.json
 - LLM 总结需 `[llm] api_key`;`--no-llm` 只出转写/截图/骨架包
 - 说话人分离需 pyannote(python + HF token);没有时名字全靠手动命名
 - 会议包重跑幂等(复用同目录覆盖);截图源是 pointtofixcraft 的 gallery.db(只读)

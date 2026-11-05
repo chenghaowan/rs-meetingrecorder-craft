@@ -93,6 +93,7 @@ mrc-recorder --status              # 最近 10 场会议 + 截图工具位置(JS
 mrc-recorder --tool-install [来源] # 安装/更新 PointToFix Craft(URL 或本地路径)
 mrc-recorder --tool-launch         # 启动截图工具
 
+mrc-recorder --transcribe <wav>        # 无头离线转写(whisper 本地),JSON 段落输出
 mrc-postprocess list               # 会议列表
 mrc-postprocess run last           # (重)跑后处理;交互式命名
 mrc-postprocess run 3 --no-llm     # 不跑 LLM,只重建包

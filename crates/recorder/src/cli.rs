@@ -35,6 +35,8 @@ pub enum CliAction {
     ToolLaunch,
     /// 指定窗口截图(经 pointtofixcraft 落库)
     ShotWindow { keyword: String, ocr: bool },
+    /// 无头转写一个 WAV(完全本地),stdout 输出 JSON 段落
+    Transcribe { wav: String, model: Option<String> },
     Bad(String),
 }
 
@@ -55,6 +57,15 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliAction {
                 return CliAction::ToolInstall { src: args.get(i).cloned() };
             }
             "--tool-launch" => return CliAction::ToolLaunch,
+            "--transcribe" => {
+                i += 1;
+                let wav = args.get(i).cloned()
+                    .ok_or_else(|| "xxx".to_string())
+                    .unwrap_or_default();
+                i += 1;
+                let model = args.get(i).cloned().filter(|a| !a.starts_with("--"));
+                return CliAction::Transcribe { wav, model };
+            }
             "--shot-window" => {
                 i += 1;
                 let keyword = args.get(i).cloned()
@@ -115,6 +126,16 @@ pub fn run(action: CliAction) -> i32 {
                 1
             }
         },
+        CliAction::Transcribe { wav, model } => match cmd_transcribe(&cfg, &wav, model.as_deref()) {
+            Ok(v) => {
+                println!("{v}");
+                0
+            }
+            Err(e) => {
+                eprintln!("错误: {e:#}");
+                1
+            }
+        },
         CliAction::ShotWindow { keyword, ocr } => match shot_window(&cfg, &keyword, ocr) {
             Ok(v) => {
                 println!("{v}");
@@ -127,11 +148,41 @@ pub fn run(action: CliAction) -> i32 {
         },
         CliAction::Bad(msg) => {
             eprintln!("参数错误: {msg}");
-            eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --shot-window 关键词 [--shot-window-ocr]]");
+            eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --shot-window 关键词 [--shot-window-ocr] | --transcribe <wav> [--model 路径]]");
             2
         }
         CliAction::Gui => 0,
     }
+}
+
+fn cmd_transcribe(cfg: &Config, wav: &str, model: Option<&str>) -> Result<serde_json::Value> {
+    use mrc_core::transcribe::{load_wav_16k, Transcriber};
+    let path = std::path::Path::new(wav);
+    let model_path = model
+        .map(std::path::PathBuf::from)
+        .or_else(|| cfg.find_whisper_model())
+        .ok_or_else(|| anyhow::anyhow!("找不到 whisper 模型(先 python scripts/fetch_whisper.py 或 --model 指定)"))?;
+    let samples = load_wav_16k(path)?;
+    let dur = samples.len() as f64 / 16000.0;
+    let t0 = std::time::Instant::now();
+    let tr = Transcriber::new(&model_path, &cfg.whisper.language)?;
+    let segs = tr.decode(&samples, 0)?;
+    let elapsed = t0.elapsed().as_secs_f64();
+    let items: Vec<serde_json::Value> = segs
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "start_ms": s.start_ms, "end_ms": s.end_ms, "text": s.text,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "wav": wav,
+        "duration_s": (dur * 10.0).round() / 10.0,
+        "model": model_path.display().to_string(),
+        "elapsed_s": (elapsed * 10.0).round() / 10.0,
+        "segments": items,
+    }))
 }
 
 fn shot_window(cfg: &Config, keyword: &str, ocr: bool) -> Result<serde_json::Value> {
