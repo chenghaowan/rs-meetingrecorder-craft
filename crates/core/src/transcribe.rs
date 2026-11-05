@@ -64,6 +64,15 @@ impl Transcriber {
         } else {
             Some(&self.language)
         });
+        // whisper-rs 默认只开 4 线程;拉满物理核(CPU 推理的实时性关键)
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(4);
+        params.set_n_threads(threads);
+        // 简体中文引导(whisper 中文常输出繁体;initial_prompt 拉回简体)
+        if self.language == "zh" {
+            params.set_initial_prompt("以下是普通话会议内容,请用简体中文转写。");
+        }
         params.set_print_progress(false);
         params.set_print_special(false);
         params.set_print_realtime(false);

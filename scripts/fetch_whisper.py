@@ -21,9 +21,8 @@ MODELS = {
     "small":  ("ggml-small.bin",  487_720_432),
     "medium": ("ggml-medium.bin", 1_532_482_640),
 }
-BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}"
-# 国内直连备选(魔搭镜像,结构相同)
-CN_URL = "https://www.modelscope.cn/models/keepitsimple/whisper.cpp/resolve/master/{}"
+BASE_URL = "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/{}"   # 国内镜像,默认
+ALT_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}"   # 直连备选
 
 
 def human(n: int) -> str:
@@ -66,6 +65,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=MODELS, default="small")
     ap.add_argument("--target", default="models")
+    ap.add_argument("--url", default="", help="自定义下载根 URL(覆盖内置双源)")
     args = ap.parse_args()
 
     name, size = MODELS[args.model]
@@ -76,7 +76,10 @@ def main() -> int:
         print(f"已存在: {dst}")
         return 0
 
-    for url in (BASE_URL.format(name), CN_URL.format(name)):
+    urls = [BASE_URL.format(name), ALT_URL.format(name)]
+    if args.url:
+        urls.insert(0, args.url.rstrip("/") + "/" + name)
+    for url in urls:
         print(f"下载 {args.model}: {url}")
         if fetch(url, dst, size):
             print(f"完成: {dst} ({human(dst.stat().st_size)})")
