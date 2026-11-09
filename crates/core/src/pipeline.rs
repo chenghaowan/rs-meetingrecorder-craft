@@ -27,6 +27,7 @@ pub enum PipelineStop {
     NamingNeeded(Vec<String>),
 }
 
+#[derive(serde::Serialize)]
 pub struct Report {
     pub meeting_id: i64,
     pub package_dir: Option<String>,

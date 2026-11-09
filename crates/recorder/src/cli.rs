@@ -1,14 +1,16 @@
 //! 无头 CLI(供脚本 / AI 代理,同 pointtofixcraft --capture 模式):
 //!
 //! ```text
-//! mrc-recorder --start [--title 标题]   # 无 GUI 开始会议,录音到回车/Ctrl+C,
-//!                                       # 结束后自动跑后处理流水线,输出 JSON 回执
+//! mrc-recorder --start [--title 标题] [--stop-file 路径]
+//!                                       # 无 GUI 开始会议; 交互终端回车结束,
+//!                                       # 无头调用方触碰 stop-file 结束;
+//!                                       # 结束后自动跑后处理流水线, 输出 JSON 回执
 //! mrc-recorder --status                 # 最近 10 场会议状态 JSON
 //! 不带参数                              # 正常启动 GUI
 //! ```
 //! 退出码:0 成功,1 失败,2 参数错误。--start 全程控制台日志可跟。
 
-use std::io::BufRead;
+use std::io::{BufRead, IsTerminal};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -28,7 +30,8 @@ use crate::i18n::Lang;
 pub enum CliAction {
     /// 正常启动 GUI
     Gui,
-    Start { title: Option<String> },
+    /// 无头录音;stop_file 存在时结束录音(供 ltl 页面等无控制台调用方)
+    Start { title: Option<String>, stop_file: Option<String> },
     Status,
     /// 工具子命令(安装/启动 pointtofixcraft)
     ToolInstall { src: Option<String> },
@@ -46,14 +49,21 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliAction {
     let args: Vec<String> = args.collect();
     let mut i = 0;
     let mut title = None;
+    let mut stop_file = None;
+    let mut start = false;
     while i < args.len() {
         match args[i].as_str() {
-            "--start" => return CliAction::Start { title: title.take() },
+            // 不再立刻返回: --start 之后的 --title/--stop-file 也要生效
+            "--start" => start = true,
             "--title" => {
                 i += 1;
                 title = args.get(i).cloned();
             }
-            "--status" => return CliAction::Status,
+            "--stop-file" => {
+                i += 1;
+                stop_file = args.get(i).cloned();
+            }
+            "--status" if !start => return CliAction::Status,
             "--tool-install" => {
                 i += 1;
                 return CliAction::ToolInstall { src: args.get(i).cloned() };
@@ -85,6 +95,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliAction {
         }
         i += 1;
     }
+    if start {
+        return CliAction::Start { title, stop_file };
+    }
     CliAction::Gui
 }
 
@@ -99,7 +112,7 @@ pub fn run(action: CliAction) -> i32 {
     let tr = cfg.lang.as_deref().and_then(Lang::from_code).unwrap_or_else(Lang::detect).strings();
     match action {
         CliAction::Status => cmd_status(&cfg),
-        CliAction::Start { title } => match cmd_start(&cfg, title.as_deref()) {
+        CliAction::Start { title, stop_file } => match cmd_start(&cfg, title.as_deref(), stop_file.as_deref()) {
             Ok(json) => {
                 println!("{json}");
                 0
@@ -259,8 +272,9 @@ fn cmd_status(cfg: &Config) -> i32 {
     0
 }
 
-/// 无头录音:回车 / Ctrl+C 结束 → 后处理(控制台交互命名)→ JSON 回执
-fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
+/// 无头录音:交互终端=回车结束;无控制台调用方(ltl 页面)传 --stop-file,
+/// 主循环轮询文件存在即结束 → 后处理 → JSON 回执
+fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Result<serde_json::Value> {
     // 网关兜底(provider=wanai 时)
     if cfg.whisper.provider == "wanai" || cfg.translate.provider == "wanai" {
         match mrc_core::gateway::ensure(cfg) {
@@ -277,7 +291,6 @@ fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
     let audio_path = cfg.audio_dir().join(format!("meeting_{meeting_id}.wav"));
     let (_cap, shared) = capture::open(&audio_path, |e| eprintln!("[capture] {e}"))
         .context("打开录音设备失败")?;
-    eprintln!("[cli] 会议 #{meeting_id} 录音中… 回车或 Ctrl+C 结束");
 
     // 转写线程(同 GUI 版逻辑)
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -347,8 +360,33 @@ fn cmd_start(cfg: &Config, title: Option<&str>) -> Result<serde_json::Value> {
         let _ = done_tx.send(res);
     });
 
-    // 等回车 / Ctrl+C
-    let _ = std::io::stdin().lock().read_line(&mut String::new());
+    // 等结束: 交互终端另起线程等回车(无终端时不等——CREATE_NO_WINDOW 下
+    // stdin 是 EOF, 会立刻返回导致录音秒停); 无头调用方靠 --stop-file 轮询
+    let interactive = std::io::stdin().is_terminal();
+    let (quit_tx, quit_rx) = mpsc::channel::<()>();
+    if interactive {
+        std::thread::spawn(move || {
+            let _ = std::io::stdin().lock().read_line(&mut String::new());
+            let _ = quit_tx.send(());
+        });
+        eprintln!("[cli] 会议 #{meeting_id} 录音中… 回车结束");
+    } else if let Some(p) = stop_file {
+        eprintln!("[cli] 会议 #{meeting_id} 录音中… 停止文件 {} 出现即结束", p);
+    } else {
+        eprintln!("[cli] 会议 #{meeting_id} 录音中… 非交互且未给 --stop-file, 将一直录到进程被杀");
+    }
+    loop {
+        if quit_rx.try_recv().is_ok() {
+            break;
+        }
+        if let Some(p) = stop_file {
+            if std::path::Path::new(p).exists() {
+                eprintln!("[cli] 检测到停止文件, 结束录音");
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
     let _ = stop_tx.send(());
     if let Ok(Err(e)) = done_rx.recv_timeout(Duration::from_secs(30)) {
         eprintln!("[warn] 转写线程异常: {e:#}");
