@@ -15,18 +15,6 @@ mod tray;
 
 use eframe::egui;
 
-fn load_icon() -> egui::IconData {
-    let img = image::load_from_memory(include_bytes!("tray_icon.png"))
-        .expect("tray_icon.png 解码失败")
-        .into_rgba8();
-    let (width, height) = img.dimensions();
-    egui::IconData {
-        rgba: img.into_raw(),
-        width,
-        height,
-    }
-}
-
 fn main() -> eframe::Result<()> {
     // 无头 CLI:--start / --status / --tool-install / --tool-launch(同 pointtofixcraft --capture)
     match cli::parse(std::env::args().skip(1)) {
@@ -58,7 +46,7 @@ fn main() -> eframe::Result<()> {
             } else {
                 egui::WindowLevel::Normal
             })
-            .with_icon(std::sync::Arc::new(load_icon())),
+            .with_icon(std::sync::Arc::new(app::load_icon())),
         ..Default::default()
     };
     // F9 全局热键

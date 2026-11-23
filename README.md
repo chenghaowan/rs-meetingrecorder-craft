@@ -27,7 +27,7 @@ CPAL capture                            Post-process
   ↓                                       ↓
 PCM buffer                              Chunk (5 min / 1000 tokens)
   ↓                                       ↓
-whisper.cpp streaming (whisper-rs)      Screenshot ↔ speech matching (±30 s)
+Gateway /asr streaming (SenseVoice)     Screenshot ↔ speech matching (±30 s)
   ↓                                       ↓
 Speaker diarization (pyannote add-on)   LLM summary — one call, structured JSON
   ↓                                       ↓
@@ -39,11 +39,11 @@ F8 screenshot → gallery.db            Ingest into RAG
 
 ## Features
 
-- **Two STT engines**: `provider = "local"` runs whisper.cpp in-process (default); `provider = "wanai"` routes audio to the WanAI Runtime gateway (`/asr`, model managed centrally by rs-aiprivaderCraft) and silently falls back to local until the gateway ships M4. The exe keeps whisper.cpp baked in either way (a few MB); what the switch removes is the 465 MB model download/management burden.
+- **One STT engine, zero model management**: all speech-to-text routes to the WanAI Runtime gateway (`/asr`, SenseVoice-small — several times faster than whisper, punctuation included, zh/en/ja/ko/yue). If the gateway is missing it is auto-installed (see below); no STT model files ever live in this repo.
 
 - **Floating mini panel** (132×96, same size as PointToFix Craft's standby bar): status light, elapsed time, start/stop, always-on-top, draggable.
 - **Live subtitle bar** at the bottom of the screen (a second native viewport): last two transcript lines + a recording timer; on-top, font size, opacity and margin are configurable.
-- **Local transcription** with whisper.cpp (whisper-rs): 12 s sliding window with tail continuation — no duplicated segments.
+- **Streaming transcription** via the gateway: 12 s sliding window with tail continuation — no duplicated segments; failed windows are retried without dropping audio.
 - **Speaker naming, the pragmatic way**: diarization only produces anonymous clusters (`SPEAKER_00`…); names come from a 10-second manual pass (sample utterances, known-name shortcuts), with **voiceprint matching** pre-filling names across meetings (192/512-dim embeddings stored as SQLite BLOBs, cosine brute-force — microseconds at hundreds of speakers).
 - **LLM minutes in one call**: long-context model summarizes the whole transcript at once and must return structured JSON (summary / decisions / actions / risks, each with an `evidence_time`); oversized transcripts automatically fall back to two halves + a merge pass.
 - **Meeting package** — plain files, no lock-in:
@@ -56,7 +56,7 @@ F8 screenshot → gallery.db            Ingest into RAG
   ├── screenshots/         # img001.png… (copied snapshots)
   └── meta.json
   ```
-- **Settings GUI**: whisper model path/language, pyannote token, LLM endpoint (any OpenAI-compatible API), subtitle options, chunk parameters, RAG URL — plus a built-in **installer for PointToFix Craft** (direct .exe link, local path, or auto-detected sibling build).
+- **Settings GUI**: STT language/window, pyannote token, LLM endpoint (any OpenAI-compatible API), subtitle options, chunk parameters, RAG URL — plus a built-in **installer for PointToFix Craft** (direct .exe link, local path, or auto-detected sibling build).
 - **i18n**: 中文 / English / Deutsch / 日本語, following the system UI language on first start; switchable in Settings.
 - **Headless CLI** for scripts and AI agents (`--start`, `--status`, `--tool-install`, `--tool-launch`), plus a `mrc-postprocess` CLI for re-running the pipeline.
 
@@ -65,8 +65,8 @@ F8 screenshot → gallery.db            Ingest into RAG
 ## Requirements
 
 - Windows 10/11 x64
-- To build: Rust 2021 + CMake + libclang (`pip install cmake libclang`; `LIBCLANG_PATH` is pre-wired in `.cargo/config.toml` to the pip-provided clang)
-- To transcribe: a [whisper.cpp ggml model](https://huggingface.co/ggerganov/whisper.cpp) (`ggml-small.bin` or larger recommended for Chinese)
+- To build: Rust 2021 (no CMake/libclang needed — whisper.cpp is gone)
+- To transcribe: nothing to download yourself — the WanAI Runtime gateway fetches and serves SenseVoice (auto-installed via `[gateway]`)
 - Optional: python + `pyannote.audio` for speaker diarization; any OpenAI-compatible API key for the LLM summary
 
 ## Build from source

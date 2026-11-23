@@ -18,7 +18,7 @@ toml = "0.8"
 base64 = "0.22"
 
 [profile.dev.package."*"]
-# 依赖用轻量优化(whisper/SQLite 在 debug 下慢到不可用),自身代码保持快速编译
+# 依赖用轻量优化(SQLite 等在 debug 下慢到不可用),自身代码保持快速编译
 opt-level = 1
 
 [profile.release]

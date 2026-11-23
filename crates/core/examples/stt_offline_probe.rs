@@ -1,51 +1,25 @@
-//! 离线 STT 端到端探针:喂一段 16k mono WAV,用本地 whisper 转写。
+//! STT 端到端探针:喂一段 WAV,走 wanai 网关 /asr(SenseVoice)转写。
 //!
-//! 用法: cargo run --release -p mrc-core --example stt_offline_probe -- <wav路径> [模型路径]
-//! 模型缺省自动查找(models/ggml-*.bin)。完全不联网。
+//! 用法: cargo run --release -p mrc-core --example stt_offline_probe -- <wav路径> [网关URL]
+//! 网关缺省 http://127.0.0.1:17800(未启动请先跑 mrc-recorder --gateway)。
 
-use mrc_core::transcribe::Transcriber;
+use mrc_core::transcribe::{load_wav_16k, RemoteAsr};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let wav_path = args.get(1).expect("用法: stt_offline_probe <wav> [模型路径]");
-    let model = args
-        .get(2)
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            // 与 Config::find_whisper_model 相同的查找逻辑(简化版:仓库 models\)
-            let dir = std::path::Path::new("models");
-            let mut bins: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-                .ok()?
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "bin"))
-                .collect();
-            bins.sort();
-            bins.into_iter().next()
-        })
-        .expect("找不到 whisper 模型: 先 python scripts/fetch_whisper.py");
+    let wav_path = args.get(1).expect("用法: stt_offline_probe <wav> [网关URL]");
+    let gateway = args.get(2).cloned().unwrap_or_else(|| "http://127.0.0.1:17800".into());
 
-    let mut reader = hound::WavReader::open(wav_path)?;
-    let spec = reader.spec();
-    assert_eq!(spec.sample_rate, mrc_core::capture::TARGET_RATE, "WAV 须为 16kHz");
-    assert_eq!(spec.channels, 1, "WAV 须为单声道");
-    let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|s| s.unwrap() as f32 / 32768.0)
-        .collect();
+    let samples = load_wav_16k(std::path::Path::new(wav_path))?;
     println!(
-        "模型: {}\n音频: {:.1}s @16kHz mono",
-        model.display(),
+        "网关: {gateway}\n音频: {:.1}s(重采样 16kHz mono)",
         samples.len() as f64 / 16000.0
     );
 
+    let asr = RemoteAsr::new(&gateway, "zh");
     let t0 = std::time::Instant::now();
-    let tr = Transcriber::new(&model, "zh")?;
-    println!("模型加载: {:.1}s", t0.elapsed().as_secs_f64());
-
-    let t1 = std::time::Instant::now();
-    let segs = tr.decode(&samples, 0)?;
-    println!("推理: {:.1}s", t1.elapsed().as_secs_f64());
+    let segs = asr.transcribe(&samples)?;
+    println!("转写: {:.1}s", t0.elapsed().as_secs_f64());
     for s in &segs {
         println!("[{:>5.1}s] {}", s.start_ms as f64 / 1000.0, s.text);
     }

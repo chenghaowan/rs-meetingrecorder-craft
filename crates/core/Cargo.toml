@@ -4,12 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "会议记录核心库:采集/转写/说话人/后处理/会议包"
 
-[features]
-default = ["whisper"]
-# whisper-rs 需要本机 cmake 构建 whisper.cpp;无 cmake 环境可 --no-default-features
-# (仅失去实时转写能力,采集/归档/后处理链路照常)
-whisper = ["dep:whisper-rs"]
-
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
@@ -27,4 +21,3 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
 ] }
-whisper-rs = { version = "0.14", optional = true }

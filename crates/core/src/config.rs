@@ -8,24 +8,18 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct WhisperCfg {
-    /// "local"(whisper-rs 进程内,默认) | "wanai"(网关 /asr,未就绪自动回落 local)
-    pub provider: String,
-    /// ggml 模型路径;留空则依次找 exe 目录 models\、data_dir\models\ 下的 *.bin
-    pub model_path: Option<PathBuf>,
+pub struct SttCfg {
     /// 转写语言(zh/en/auto…)
     pub language: String,
-    /// 实时解码窗口秒数:攒够这么长就送 whisper,并把已确定的尾巴提交
+    /// 实时解码窗口秒数:攒够这么长就送网关 /asr,并把已确定的尾巴提交
     pub window_secs: f64,
-    /// wanai 网关地址(rs-aiprivaderCraft;与 [translate] wanai_url 同一个服务)
+    /// wanai 网关地址(兼容回退用;正式入口是 [gateway].url)
     pub gateway_url: String,
 }
 
-impl Default for WhisperCfg {
+impl Default for SttCfg {
     fn default() -> Self {
         Self {
-            provider: "local".into(),
-            model_path: None,
             language: "zh".into(),
             window_secs: 12.0,
             gateway_url: "http://127.0.0.1:17800".into(),
@@ -162,7 +156,9 @@ pub struct Config {
     /// 会议包根目录(默认 data_dir/packages)
     pub packages_dir: Option<PathBuf>,
 
-    pub whisper: WhisperCfg,
+    /// STT(SenseVoice,走 wanai 网关;alias 兼容旧 [whisper] 段)
+    #[serde(alias = "whisper")]
+    pub stt: SttCfg,
     pub diarize: DiarizeCfg,
     pub llm: LlmCfg,
     pub shots: ShotsCfg,
@@ -221,7 +217,7 @@ impl Default for TranslateCfg {
     }
 }
 
-/// wanai 网关配置(地址统一从这里取;whisper/translate 段的旧 url 字段仅兼容读取)
+/// wanai 网关配置(地址统一从这里取;stt/translate 段的旧 url 字段仅兼容读取)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GatewayCfg {
@@ -290,13 +286,7 @@ impl Default for Config {
             data_dir: None,
             audio_dir: None,
             packages_dir: None,
-            whisper: WhisperCfg {
-                provider: "local".into(),
-                model_path: None,
-                language: "zh".into(),
-                window_secs: 12.0,
-                gateway_url: "http://127.0.0.1:17800".into(),
-            },
+            stt: SttCfg::default(),
             diarize: DiarizeCfg {
                 python: None,
                 script: None,
@@ -399,8 +389,8 @@ impl Config {
         if !self.gateway.url.trim().is_empty() {
             return self.gateway.url.trim().trim_end_matches('/').to_string();
         }
-        if self.whisper.provider == "wanai" && !self.whisper.gateway_url.trim().is_empty() {
-            return self.whisper.gateway_url.trim().to_string();
+        if !self.stt.gateway_url.trim().is_empty() {
+            return self.stt.gateway_url.trim().to_string();
         }
         if !self.translate.wanai_url.trim().is_empty() {
             return self.translate.wanai_url.trim().to_string();
@@ -412,47 +402,5 @@ impl Config {
         self.packages_dir
             .clone()
             .unwrap_or_else(|| self.data_dir().join("packages"))
-    }
-
-    /// whisper 模型查找:配置路径 → exe 目录 models\*.bin → data_dir\models\*.bin
-    pub fn find_whisper_model(&self) -> Option<PathBuf> {
-        if let Some(p) = &self.whisper.model_path {
-            if p.exists() {
-                return Some(p.clone());
-            }
-        }
-        let mut roots = vec![];
-        if let Ok(cwd) = std::env::current_dir() {
-            roots.push(cwd);
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(p) = exe.parent().map(|p| p.to_path_buf()) {
-                roots.push(p);
-            }
-        }
-        roots.push(self.data_dir());
-        for root in roots {
-            let dir = root.join("models");
-            let Ok(rd) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut bins: Vec<PathBuf> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "bin"))
-                .collect();
-            // 多个模型并存时按质量优先:small > base > tiny > medium > 其它
-            let rank = |p: &std::path::Path| -> usize {
-                let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                if n.contains("small") { 0 } else if n.contains("base") { 1 }
-                else if n.contains("tiny") { 2 } else if n.contains("medium") { 3 }
-                else { 4 }
-            };
-            bins.sort_by_key(|p| rank(p));
-            if let Some(p) = bins.into_iter().next() {
-                return Some(p);
-            }
-        }
-        None
     }
 }

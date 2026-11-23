@@ -1,111 +1,13 @@
-//! whisper-rs 流式转写。
+//! 流式转写(wanai 网关 /asr,SenseVoice,唯一 STT 引擎)。
 //!
-//! 策略:解码线程攒 window_secs(默认12s)送 whisper;取全部返回段的最后一段
+//! 策略:解码线程攒 window_secs(默认12s)送网关;取全部返回段的最后一段
 //! 结束点 E 作为"已确定点",只落库 E 之前的段,把 E 之后的样本还回缓冲续传——
 //! 这样下个窗口从已确定点接着解,天然无重复。长静音由 capture::trim_silence 控制。
-//!
-//! 特性开关:whisper feature 关闭时此处编译为空实现,采集/归档照常。
+//! 网关不可用时样本还回、下个 tick 重试(gateway::ensure 负责自动安装/拉起)。
 
 use anyhow::{bail, Context, Result};
 
-#[cfg(feature = "whisper")]
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
-
 use crate::capture::TARGET_RATE;
-
-pub struct Transcriber {
-    #[cfg(feature = "whisper")]
-    ctx: WhisperContext,
-    #[cfg(feature = "whisper")]
-    language: String,
-    _priv: (),
-}
-
-#[derive(Debug, Clone)]
-pub struct RawSegment {
-    /// 相对入参样本数组起点的毫秒
-    pub start_ms: i64,
-    pub end_ms: i64,
-    pub text: String,
-}
-
-impl Transcriber {
-    pub fn new(model_path: &std::path::Path, language: &str) -> Result<Self> {
-        #[cfg(feature = "whisper")]
-        {
-            let ctx = WhisperContext::new_with_params(
-                model_path.to_string_lossy().as_ref(),
-                WhisperContextParameters::default(),
-            )
-            .with_context(|| format!("加载 whisper 模型失败: {}", model_path.display()))?;
-            Ok(Self {
-                ctx,
-                language: language.to_string(),
-                _priv: (),
-            })
-        }
-        #[cfg(not(feature = "whisper"))]
-        {
-            let _ = (model_path, language);
-            Err(anyhow::anyhow!("编译未启用 whisper feature,转写不可用"))
-        }
-    }
-
-    /// 解码一段 16k mono 样本;off_ms 为样本起点对应的会议相对毫秒
-    #[cfg(feature = "whisper")]
-    pub fn decode(&self, samples: &[f32], off_ms: i64) -> Result<Vec<RawSegment>> {
-        if samples.is_empty() {
-            return Ok(vec![]);
-        }
-        let mut state = self.ctx.create_state().context("创建 whisper 状态失败")?;
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(if self.language == "auto" {
-            None
-        } else {
-            Some(&self.language)
-        });
-        // whisper-rs 默认只开 4 线程;拉满物理核(CPU 推理的实时性关键)
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
-        params.set_n_threads(threads);
-        // 简体中文引导(whisper 中文常输出繁体;initial_prompt 拉回简体)
-        if self.language == "zh" {
-            params.set_initial_prompt("以下是普通话会议内容,请用简体中文转写。");
-        }
-        params.set_print_progress(false);
-        params.set_print_special(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        params.set_single_segment(false);
-        params.set_no_context(true);
-        state
-            .full(params, &samples.to_vec())
-            .context("whisper 推理失败")?;
-
-        let n = state.full_n_segments()?;
-        let mut out = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            let t0 = state.full_get_segment_t0(i)?; // 毫秒
-            let t1 = state.full_get_segment_t1(i)?;
-            let text = state.full_get_segment_text(i)?.trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-            out.push(RawSegment {
-                start_ms: off_ms + t0,
-                end_ms: off_ms + t1,
-                text,
-            });
-        }
-        Ok(out)
-    }
-
-    #[cfg(not(feature = "whisper"))]
-    pub fn decode(&self, _samples: &[f32], _off_ms: i64) -> Result<Vec<RawSegment>> {
-        Err(anyhow::anyhow!("编译未启用 whisper feature,转写不可用"))
-    }
-}
 
 /// 把 16k mono f32 样本编码为 WAV 字节(网关 /asr 上传用)。
 pub fn encode_wav_16k(samples: &[f32]) -> Vec<u8> {
@@ -138,6 +40,14 @@ pub struct RemoteAsr {
     pub gateway_url: String,
     pub language: String,
     agent: ureq::Agent,
+}
+
+/// 已落库确定的转写段(会议相对毫秒)
+#[derive(Debug, Clone)]
+pub struct RawSegment {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
 }
 
 /// 远端返回的宽容段落(秒或毫秒都能吃)
@@ -269,8 +179,7 @@ pub fn load_wav_16k(path: &std::path::Path) -> Result<Vec<f32>> {
 
 /// 流式解码循环状态机:供解码线程每 tick 调用。
 pub struct Streaming {
-    pub transcriber: Option<Transcriber>,
-    /// wanai 网关执行器(与 transcriber 并存:远端失败回落本地,不丢内容)
+    /// wanai 网关执行器(唯一 STT 引擎;None = 只归档不转写)
     pub remote: Option<RemoteAsr>,
     pub window_secs: f64,
     /// 已落库的最后确定点(会议相对毫秒)
@@ -287,43 +196,29 @@ pub enum StreamEvent {
 }
 
 impl Streaming {
-    pub fn new(transcriber: Option<Transcriber>, window_secs: f64) -> Self {
+    pub fn new(remote: Option<RemoteAsr>, window_secs: f64) -> Self {
         Self {
-            transcriber,
-            remote: None,
+            remote,
             window_secs,
             committed_ms: 0,
         }
     }
 
-    /// 解码一窗:provider=wanai 先走网关,失败回落本地 whisper-rs
-    pub fn decode_window(
-        &self,
-        tr: &Transcriber,
-        buf: &[f32],
-        buf_start_ms: i64,
-    ) -> Result<Vec<RawSegment>> {
-        if let Some(remote) = self.remote.as_ref() {
-            match remote.transcribe(buf) {
-                Ok(segs) => {
-                    return Ok(segs
-                        .into_iter()
-                        .map(|r| RawSegment {
-                            start_ms: buf_start_ms + r.start_ms,
-                            end_ms: buf_start_ms + r.end_ms,
-                            text: r.text,
-                        })
-                        .collect());
-                }
-                Err(e) => {
-                    // 网关未就绪(M4 前常态):回落本地,只提示一次由调用方日志控制
-                    return tr
-                        .decode(buf, buf_start_ms)
-                        .map_err(|le| anyhow::anyhow!("网关/本地均失败: {e}; 本地: {le}"));
-                }
-            }
-        }
-        tr.decode(buf, buf_start_ms)
+    /// 解码一窗:走网关 /asr(SenseVoice)。
+    pub fn decode_window(&self, buf: &[f32], buf_start_ms: i64) -> Result<Vec<RawSegment>> {
+        let remote = self
+            .remote
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("转写器未配置(网关 /asr)"))?;
+        let segs = remote.transcribe(buf)?;
+        Ok(segs
+            .into_iter()
+            .map(|r| RawSegment {
+                start_ms: buf_start_ms + r.start_ms,
+                end_ms: buf_start_ms + r.end_ms,
+                text: r.text,
+            })
+            .collect())
     }
 
     /// 每个解码 tick:从 shared 取样本,够一个窗口才解;返回事件并处理 give_back。
@@ -331,8 +226,8 @@ impl Streaming {
         let (buf, buf_start_ms) = cap.take_all();
         let win_samples = (self.window_secs * TARGET_RATE as f64) as usize;
 
-        // 无转写器(未启用/无模型):只做静音裁剪
-        let Some(tr) = self.transcriber.as_ref() else {
+        // 无转写器:只做静音裁剪(纯归档模式)
+        let Some(_) = self.remote.as_ref() else {
             cap.trim_silence(30.0, 5.0);
             return StreamEvent::Idle;
         };
@@ -348,7 +243,7 @@ impl Streaming {
             return StreamEvent::Idle;
         }
 
-        match self.decode_window(tr, &buf, buf_start_ms) {
+        match self.decode_window(&buf, buf_start_ms) {
             Ok(segs) => {
                 // 最后确定点 E(相对会议)
                 let last_end = segs.last().map(|s| s.end_ms).unwrap_or(buf_start_ms);

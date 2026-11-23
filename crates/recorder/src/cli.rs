@@ -20,7 +20,7 @@ use mrc_core::capture;
 use mrc_core::config::Config;
 use mrc_core::db;
 use mrc_core::pipeline::{self, PipelineStop};
-use mrc_core::transcribe::{RemoteAsr, Streaming, Transcriber};
+use mrc_core::transcribe::{RemoteAsr, Streaming};
 use mrc_core::tools;
 use mrc_core::translate::Translator;
 use mrc_core::windowcap;
@@ -40,8 +40,8 @@ pub enum CliAction {
     GatewayStart,
     /// 指定窗口截图(经 pointtofixcraft 落库)
     ShotWindow { keyword: String, ocr: bool },
-    /// 无头转写一个 WAV(完全本地),stdout 输出 JSON 段落
-    Transcribe { wav: String, model: Option<String> },
+    /// 无头转写一个 WAV(走网关 /asr),stdout 输出 JSON 段落
+    Transcribe { wav: String },
     Bad(String),
 }
 
@@ -75,9 +75,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliAction {
                 let wav = args.get(i).cloned()
                     .ok_or_else(|| "xxx".to_string())
                     .unwrap_or_default();
-                i += 1;
-                let model = args.get(i).cloned().filter(|a| !a.starts_with("--"));
-                return CliAction::Transcribe { wav, model };
+                return CliAction::Transcribe { wav };
             }
             "--shot-window" => {
                 i += 1;
@@ -142,7 +140,7 @@ pub fn run(action: CliAction) -> i32 {
                 1
             }
         },
-        CliAction::Transcribe { wav, model } => match cmd_transcribe(&cfg, &wav, model.as_deref()) {
+        CliAction::Transcribe { wav } => match cmd_transcribe(&cfg, &wav) {
             Ok(v) => {
                 println!("{v}");
                 0
@@ -174,38 +172,30 @@ pub fn run(action: CliAction) -> i32 {
         },
         CliAction::Bad(msg) => {
             eprintln!("参数错误: {msg}");
-            eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --shot-window 关键词 [--shot-window-ocr] | --transcribe <wav> [--model 路径]]");
-    eprintln!("  [whisper] provider = local(默认,进程内) | wanai(网关 /asr,未就绪回落 local)");
-    eprintln!("  --gateway          确保网关就绪(健康检查→本地启动→release 下载)");
+            eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --shot-window 关键词 [--shot-window-ocr] | --transcribe <wav>]");
+    eprintln!("  [stt] 唯一引擎 = wanai 网关 /asr(SenseVoice);--gateway 确保就绪(健康检查→本地启动→release 自动下载)");
             2
         }
         CliAction::Gui => 0,
     }
 }
 
-fn cmd_transcribe(cfg: &Config, wav: &str, model: Option<&str>) -> Result<serde_json::Value> {
-    use mrc_core::transcribe::{load_wav_16k, RemoteAsr, Streaming, Transcriber};
-    if cfg.whisper.provider == "wanai" {
-        let _ = mrc_core::gateway::ensure(cfg);
-    }
-    let path = std::path::Path::new(wav);
-    let model_path = model
-        .map(std::path::PathBuf::from)
-        .or_else(|| cfg.find_whisper_model())
-        .ok_or_else(|| anyhow::anyhow!("找不到 whisper 模型(先 python scripts/fetch_whisper.py 或 --model 指定)"))?;
-    let samples = load_wav_16k(path)?;
+fn cmd_transcribe(cfg: &Config, wav: &str) -> Result<serde_json::Value> {
+    use mrc_core::transcribe::{load_wav_16k, RemoteAsr};
+    let _ = mrc_core::gateway::ensure(cfg); // 未就绪就拉起/自动安装;失败由下面的 /asr 报错暴露
+    let samples = load_wav_16k(std::path::Path::new(wav))?;
     let dur = samples.len() as f64 / 16000.0;
     let t0 = std::time::Instant::now();
-    let tr = Transcriber::new(&model_path, &cfg.whisper.language)?;
-    let mut st = Streaming::new(Some(tr), cfg.whisper.window_secs);
-    if cfg.whisper.provider == "wanai" {
-        st.remote = Some(RemoteAsr::new(&cfg.whisper.gateway_url, &cfg.whisper.language));
-    }
-    let segs = st.decode_window(
-        st.transcriber.as_ref().expect("local transcriber"),
-        &samples,
-        0,
-    )?;
+    let asr = RemoteAsr::new(&cfg.gateway_url(), &cfg.stt.language);
+    let segs = asr
+        .transcribe(&samples)?
+        .into_iter()
+        .map(|s| mrc_core::transcribe::RawSegment {
+            start_ms: s.start_ms,
+            end_ms: s.end_ms,
+            text: s.text,
+        })
+        .collect::<Vec<_>>();
     let elapsed = t0.elapsed().as_secs_f64();
     let items: Vec<serde_json::Value> = segs
         .iter()
@@ -218,7 +208,7 @@ fn cmd_transcribe(cfg: &Config, wav: &str, model: Option<&str>) -> Result<serde_
     Ok(serde_json::json!({
         "wav": wav,
         "duration_s": (dur * 10.0).round() / 10.0,
-        "model": model_path.display().to_string(),
+        "engine": "wanai-gateway/sensevoice",
         "elapsed_s": (elapsed * 10.0).round() / 10.0,
         "segments": items,
     }))
@@ -275,12 +265,10 @@ fn cmd_status(cfg: &Config) -> i32 {
 /// 无头录音:交互终端=回车结束;无控制台调用方(ltl 页面)传 --stop-file,
 /// 主循环轮询文件存在即结束 → 后处理 → JSON 回执
 fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Result<serde_json::Value> {
-    // 网关兜底(provider=wanai 时)
-    if cfg.whisper.provider == "wanai" || cfg.translate.provider == "wanai" {
-        match mrc_core::gateway::ensure(cfg) {
-            Ok(msg) => eprintln!("[gateway] {msg}"),
-            Err(e) => eprintln!("[gateway] 未就绪: {e:#}"),
-        }
+    // 网关兜底(STT 唯一引擎在网关上;ensure 会自动拉起/安装)
+    match mrc_core::gateway::ensure(cfg) {
+        Ok(msg) => eprintln!("[gateway] {msg}"),
+        Err(e) => eprintln!("[gateway] 未就绪: {e:#}(转写降级为只归档,期间持续重试)"),
     }
     let now = db::now_ms();
     let title = title
@@ -298,24 +286,9 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
     let cfg2 = cfg.clone();
     let shared2 = shared.clone();
     let translator = Translator::with_gateway(&cfg2.translate, &cfg2.llm, Some(&cfg2.gateway_url())).ok();
-    let remote_asr = if cfg2.whisper.provider == "wanai" {
-        Some(RemoteAsr::new(&cfg2.whisper.gateway_url, &cfg2.whisper.language))
-    } else {
-        None
-    };
+    let remote_asr = Some(RemoteAsr::new(&cfg2.gateway_url(), &cfg2.stt.language));
     std::thread::spawn(move || {
-        let tr_th = cfg2.lang.as_deref().and_then(Lang::from_code).unwrap_or_else(Lang::detect).strings();
-        let transcriber = cfg2.find_whisper_model().and_then(|m| {
-            match Transcriber::new(&m, &cfg2.whisper.language) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    eprintln!("[warn] {}: {e:#}", tr_th.err_tr_disabled);
-                    None
-                }
-            }
-        });
-        let mut streaming = Streaming::new(transcriber, cfg2.whisper.window_secs);
-        streaming.remote = remote_asr;
+        let mut streaming = Streaming::new(remote_asr, cfg2.stt.window_secs);
         let mut idx: i64 = 0;
         let res = (|| -> Result<()> {
             let conn = db::open(&cfg2.db_path())?;

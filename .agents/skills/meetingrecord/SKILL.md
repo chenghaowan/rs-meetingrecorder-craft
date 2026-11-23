@@ -34,15 +34,8 @@ mrc-recorder --shot-window 关键词 [--shot-window-ocr]
                                            # 指定窗口截图:标题关键词→DWM 精确矩形→
                                            # pointtofixcraft 落库,JSON 回执(shot_id/file/ocr)
 mrc-recorder --gateway                     # 确保网关就绪(health→本地拉起→release 下载)
-mrc-recorder --transcribe <wav> [--model 路径]
-                                           # 无头离线转写(whisper 本地),JSON 段落回执
-                                           # 含 duration_s/elapsed_s;任意采样率单/双声道皆可
-mrc-recorder --shot-window 关键词 [--shot-window-ocr]
-                                           # 指定窗口截图:标题关键词→DWM 精确矩形→
-                                           # pointtofixcraft 落库,JSON 回执(shot_id/file/ocr)
-mrc-recorder --gateway                     # 确保网关就绪(health→本地拉起→release 下载)
-mrc-recorder --transcribe <wav> [--model 路径]
-                                           # 无头离线转写(whisper 本地),JSON 段落回执
+mrc-recorder --transcribe <wav>
+                                           # 无头转写(网关 SenseVoice),JSON 段落回执
                                            # 含 duration_s/elapsed_s;任意采样率单/双声道皆可
 ```
 
@@ -75,12 +68,6 @@ mrc-recorder --transcribe recording.wav          # JSON: {segments:[{start_ms,en
 ```
 拿转写文本再去喂 [llm] 做纪要。
 
-**离线转写任意录音**(比如用户丢来一段会议录音要纪要):
-```bash
-mrc-recorder --transcribe recording.wav          # JSON: {segments:[{start_ms,end_ms,text}]}
-```
-拿转写文本再去喂 [llm] 做纪要。
-
 **全库检索**:meetings.db 无 FTS,直接 SQL:
 ```sql
 SELECT m.id, m.title, m.started_at FROM meetings m WHERE m.status='done';
@@ -91,7 +78,7 @@ SELECT text FROM segments WHERE meeting_id=3 AND text LIKE '%偷胶%';
 
 ## 4. 注意
 
-- 转写完全本地(whisper.cpp):模型 `models\ggml-small.bin`(465MB,缺则 `python scripts/fetch_whisper.py`);多模型并存按 small>base>tiny 优先自动选;输出简体中文
+- 转写唯一引擎 = wanai 网关 /asr(SenseVoice,zh/en/ja/ko/yue,自带标点;[stt] 配语言/窗口);网关不可用时自动降级只归档并持续重试
 - 网关(rs-aiprivaderCraft)是必要软件:`mrc-recorder --gateway` 或 GUI 设置里可见状态;health 探测→本地 exe→gh release 下载 三段式;模型(SenseVoice/opus-mt/BGE)由网关自动下载,本项目不管理
 - 字幕实时翻译(`[translate]`):`provider = "wanai"` 走本地网关 rs-aiprivaderCraft(opus-mt,127.0.0.1:17800,网关 M3 前自动降级不翻);`"llm"` 复用 [llm] 云端;`"baidu"` 百度 API。译文在 `segments.translation`/字幕条第二行/transcript.json
 - LLM 总结需 `[llm] api_key`;`--no-llm` 只出转写/截图/骨架包

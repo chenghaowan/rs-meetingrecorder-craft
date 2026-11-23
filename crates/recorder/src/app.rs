@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, PointerButton, Pos2, RichText, ScrollArea,
-    TextEdit, ViewportCommand, WindowLevel,
+    TextEdit, ViewportCommand, ViewportId, WindowLevel,
 };
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use rusqlite::Connection;
@@ -16,7 +16,7 @@ use mrc_core::capture::{self, CaptureShared};
 use mrc_core::config::Config;
 use mrc_core::db;
 use mrc_core::pipeline::{self, PipelineStop};
-use mrc_core::transcribe::{RemoteAsr, Streaming, Transcriber};
+use mrc_core::transcribe::{RemoteAsr, Streaming};
 use mrc_core::translate::Translator;
 use mrc_core::{tools, windowcap};
 
@@ -24,8 +24,24 @@ use crate::i18n::{self, Lang};
 use crate::subtitle::{self, SharedLive};
 use crate::tray::{self, TrayEvent};
 
+/// 主窗/设置窗视口共用的应用图标
+pub fn load_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("tray_icon.png"))
+        .expect("tray_icon.png 解码失败")
+        .into_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }
+}
+
 pub const BASE_SIZE: [f32; 2] = [132.0, 96.0]; // 同 pointtofixcraft 待机工具条
 const TRANS_SIZE: [f32; 2] = [360.0, 470.0];
+// 设置/命名窗必须是独立原生视口:egui::Window 画在 132×96 的主视口里会被裁成小块且拖不动
+const SETTINGS_SIZE: [f32; 2] = [470.0, 640.0];
+const NAMING_SIZE: [f32; 2] = [440.0, 600.0];
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -117,11 +133,8 @@ impl ToolJob {
 
 #[derive(Default)]
 struct Draft {
-    whisper_provider: String,
-    whisper_gateway: String,
-    whisper_model: String,
-    whisper_lang: String,
-    whisper_window: String,
+    stt_lang: String,
+    stt_window: String,
     diarize_enabled: bool,
     diarize_python: String,
     diarize_hf: String,
@@ -156,11 +169,8 @@ struct Draft {
 impl Draft {
     fn from_cfg(c: &Config) -> Self {
         Self {
-            whisper_provider: c.whisper.provider.clone(),
-            whisper_gateway: c.whisper.gateway_url.clone(),
-            whisper_model: c.whisper.model_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-            whisper_lang: c.whisper.language.clone(),
-            whisper_window: c.whisper.window_secs.to_string(),
+            stt_lang: c.stt.language.clone(),
+            stt_window: c.stt.window_secs.to_string(),
             diarize_enabled: c.diarize.enabled,
             diarize_python: c.diarize.python.clone().unwrap_or_default(),
             diarize_hf: c.diarize.hf_token.clone().unwrap_or_default(),
@@ -199,20 +209,8 @@ impl Draft {
 
     fn apply(self, old: &Config) -> Config {
         let mut c = old.clone();
-        let prov = self.whisper_provider.trim();
-        c.whisper.provider = match prov {
-            "wanai" => "wanai".to_string(),
-            _ => "local".to_string(),
-        };
-        c.whisper.gateway_url = if self.whisper_gateway.trim().is_empty() {
-            "http://127.0.0.1:17800".into()
-        } else {
-            self.whisper_gateway.trim().into()
-        };
-        let p = self.whisper_model.trim();
-        c.whisper.model_path = (!p.is_empty()).then(|| std::path::PathBuf::from(p));
-        c.whisper.language = if self.whisper_lang.trim().is_empty() { "zh".into() } else { self.whisper_lang.trim().into() };
-        c.whisper.window_secs = self.parse(&self.whisper_window, c.whisper.window_secs).max(4.0);
+        c.stt.language = if self.stt_lang.trim().is_empty() { "zh".into() } else { self.stt_lang.trim().into() };
+        c.stt.window_secs = self.parse(&self.stt_window, c.stt.window_secs).max(4.0);
         c.diarize.enabled = self.diarize_enabled;
         c.diarize.python = (!self.diarize_python.trim().is_empty()).then(|| self.diarize_python.trim().into());
         c.diarize.hf_token = (!self.diarize_hf.trim().is_empty()).then(|| self.diarize_hf.trim().into());
@@ -246,7 +244,7 @@ impl Draft {
         c.gateway.auto_start = self.gw_auto_start;
         // 旧字段同步(兼容回退读取)
         c.translate.wanai_url = c.gateway.url.clone();
-        c.whisper.gateway_url = c.gateway.url.clone();
+        c.stt.gateway_url = c.gateway.url.clone();
         c.translate.from_lang = if self.tr_from.trim().is_empty() { "zh".into() } else { self.tr_from.trim().into() };
         c.translate.to_lang = if self.tr_to.trim().is_empty() { "en".into() } else { self.tr_to.trim().into() };
         c.translate.appid = self.tr_appid.trim().to_string();
@@ -358,11 +356,13 @@ impl App {
     }
 
     fn try_start_meeting(&mut self) -> Result<()> {
-        // 网关兜底(后台预热可能还没完成/失败):阻塞至多 30s,换取会议全程可用
-        if self.cfg.whisper.provider == "wanai" || self.cfg.translate.provider == "wanai" {
-            match mrc_core::gateway::ensure(&self.cfg) {
-                Ok(msg) => self.notice = Some((false, format!("网关: {msg}"))),
-                Err(e) => self.notice = Some((true, format!("网关未就绪: {e:#}"))),
+        // 网关兜底(后台预热可能还没完成/失败):阻塞至多 30s,换取会议全程可用。
+        // STT 只走网关(SenseVoice);ensure 会自动拉起/安装网关,失败则降级为只归档。
+        match mrc_core::gateway::ensure(&self.cfg) {
+            Ok(msg) => self.notice = Some((false, format!("网关: {msg}"))),
+            Err(e) => {
+                let tr = self.lang.strings();
+                self.notice = Some((true, format!("{}: {e:#}", tr.err_tr_disabled)));
             }
         }
         let now = db::now_ms();
@@ -385,30 +385,14 @@ impl App {
         let live2 = std::sync::Arc::clone(&self.live);
         let shared2 = shared.clone();
         let translator = Translator::with_gateway(&cfg2.translate, &cfg2.llm, Some(&cfg2.gateway_url())).ok();
-        let remote_asr = if cfg2.whisper.provider == "wanai" {
-            Some(RemoteAsr::new(&cfg2.whisper.gateway_url, &cfg2.whisper.language))
-        } else {
-            None
-        };
+        let remote_asr = Some(RemoteAsr::new(&cfg2.gateway_url(), &cfg2.stt.language));
         // 自动截图(指定窗口,防漏截):间隔 0=关;pointtofix 缺失时静默跳过
         let auto_shots = cfg2.shots.auto_window_secs > 0.0 && !cfg2.shots.default_window.trim().is_empty();
         let shot_every = std::time::Duration::from_secs_f64(cfg2.shots.auto_window_secs.max(1.0));
         let mut last_shot = std::time::Instant::now() - shot_every; // 首个 tick 立即截一张
         let pf_exe = tools::resolve_available(&cfg2);
         std::thread::spawn(move || {
-            // 模型加载放线程里(几秒),WAV 归档不等人
-            let tr_th = cfg2.lang.as_deref().and_then(Lang::from_code).unwrap_or_else(Lang::detect).strings();
-            let transcriber = cfg2.find_whisper_model().and_then(|m| {
-                match Transcriber::new(&m, &cfg2.whisper.language) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        eprintln!("[warn] {}: {e:#}", tr_th.err_tr_disabled);
-                        None
-                    }
-                }
-            });
-            let mut streaming = Streaming::new(transcriber, cfg2.whisper.window_secs);
-            streaming.remote = remote_asr;
+            let mut streaming = Streaming::new(remote_asr, cfg2.stt.window_secs);
             let mut idx: i64 = 0;
             let res = (|| -> Result<()> {
                 let conn = db::open(&cfg2.db_path())?;
@@ -730,6 +714,12 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                 Color32::from_rgba_unmultiplied(24, 26, 34, 238),
             );
 
+            // 整面板兜底拖拽(按钮/滚动区后分配,命中优先;空白处按下即可移动)
+            let bg = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+            if bg.dragged_by(PointerButton::Primary) {
+                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+
             // 行1:状态点 + 状态/计时 + ✕(整行拖拽)
             let header = rect_from(rect.min + egui::vec2(8.0, 6.0), egui::vec2(rect.width() - 16.0, 20.0));
             let resp = ui.allocate_rect(header, egui::Sense::click_and_drag());
@@ -890,10 +880,68 @@ fn chrono_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// ---------- 命名窗 ----------
+/// 无边框对话框外壳(用于独立原生视口):深色圆角底 + 可拖拽标题栏 + ✕。
+/// body/footer 分别填充内容区(自行滚动)和底部按钮区。返回是否点了 ✕。
+fn dialog_shell(
+    ctx: &egui::Context,
+    vp: ViewportId,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui),
+    footer: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut closed = false;
+    egui::CentralPanel::default()
+        .frame(Frame::new().fill(Color32::TRANSPARENT))
+        .show(ctx, |ui| {
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(12),
+                Color32::from_rgba_unmultiplied(24, 26, 34, 245),
+            );
+
+            // 标题栏:整行拖拽,右侧 ✕
+            let header =
+                rect_from(rect.min + egui::vec2(12.0, 5.0), egui::vec2(rect.width() - 24.0, 26.0));
+            let resp = ui.allocate_rect(header, egui::Sense::click_and_drag());
+            if resp.dragged_by(PointerButton::Primary) {
+                ctx.send_viewport_cmd_to(vp, ViewportCommand::StartDrag);
+            }
+            ui.painter().text(
+                Pos2::new(header.left(), header.center().y),
+                Align2::LEFT_CENTER,
+                title,
+                FontId::proportional(14.0),
+                Color32::from_rgb(225, 228, 235),
+            );
+            let r_close = head_btn(ui, header.right() - 12.0, header.center().y, "✕");
+            if ui.input(|i| i.pointer.primary_released()) {
+                let p = ui.input(|i| i.pointer.interact_pos().unwrap_or_default());
+                if r_close.contains(p) {
+                    closed = true;
+                }
+            }
+
+            // 内容区(滚动交给 body)
+            let content = egui::Rect::from_min_max(
+                rect.min + egui::vec2(14.0, 38.0),
+                rect.max - egui::vec2(14.0, 48.0),
+            );
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content), body);
+            // 底部按钮区
+            let foot = egui::Rect::from_min_max(
+                Pos2::new(rect.left() + 14.0, rect.bottom() - 44.0),
+                Pos2::new(rect.right() - 14.0, rect.bottom() - 10.0),
+            );
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(foot), footer);
+        });
+    closed
+}
+
+// ---------- 命名窗(独立原生视口,egui::Window 会被 132×96 主视口裁剪) ----------
 
 fn paint_naming(app: &mut App, ctx: &egui::Context) {
-    // 全部快照,窗口闭包里只动局部副本
+    // 全部快照,视口闭包里只动局部副本
     let tr = app.lang.strings();
     let (meeting_id, known, snapshot) = match app.naming.as_ref() {
         Some(np) => (
@@ -906,74 +954,88 @@ fn paint_naming(app: &mut App, ctx: &egui::Context) {
         ),
         None => return,
     };
-    let mut open = app.show_naming;
     let mut inputs = snapshot.iter().map(|(_, v, ..)| v.clone()).collect::<Vec<_>>();
-    let mut confirmed = false;
-    let mut deferred = false;
+    let vp = ViewportId(egui::Id::new("naming"));
+    let title = tr.naming_title.to_string();
+    let hint = tr.naming_hint;
 
-    egui::Window::new(tr.naming_title)
-        .open(&mut open)
-        .resizable(false)
-        .collapsible(false)
-        .show(ctx, |ui| {
-            ui.label(
-                RichText::new(tr.naming_hint)
-                    .size(12.0)
-                    .color(Color32::from_rgb(150, 158, 172)),
-            );
-            ui.add_space(4.0);
-            ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-                for (i, (key, _, dur_ms, n_seg, sample, proposed, sim)) in snapshot.iter().enumerate() {
-                    let mins = dur_ms / 60000;
-                    let secs = (dur_ms % 60000) / 1000;
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(key).strong().size(14.0));
-                        ui.label(
-                            RichText::new(i18n::fill(tr.spoken_stat, &[&mins.to_string(), &secs.to_string(), &n_seg.to_string()]))
-                                .size(11.5)
-                                .color(Color32::from_rgb(150, 158, 172)),
-                        );
-                    });
-                    match (proposed, sim) {
-                        (Some(p), Some(s)) => {
-                            ui.label(RichText::new(i18n::fill(tr.vp_prefill, &[p, &format!("{s:.2}")])).size(11.5).color(Color32::from_rgb(140, 200, 160)));
-                        }
-                        (Some(p), None) => {
-                            ui.label(RichText::new(i18n::fill(tr.prefill, &[p])).size(11.5).color(Color32::from_rgb(140, 200, 160)));
-                        }
-                        _ => {}
-                    }
-                    ui.label(RichText::new(i18n::fill(tr.sample, &[sample])).size(11.5).color(Color32::from_rgb(170, 176, 188)));
-                    ui.add(
-                        TextEdit::singleline(&mut inputs[i])
-                            .hint_text(tr.input_name)
-                            .desired_width(240.0),
-                    );
-                    if !known.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(tr.history).size(11.0).color(Color32::from_rgb(150, 158, 172)));
-                            for kn in &known {
-                                if ui.add(egui::Button::new(RichText::new(kn).size(11.0))).clicked() {
-                                    inputs[i] = kn.clone();
+    let (closed, confirmed, deferred) = ctx.show_viewport_immediate(
+        vp,
+        egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            .with_inner_size(NAMING_SIZE)
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true),
+        |vctx, _class| {
+            let mut confirmed = false;
+            let mut deferred = false;
+            let closed = dialog_shell(
+                vctx,
+                vp,
+                &title,
+                |ui| {
+                    ui.label(RichText::new(hint).size(12.0).color(Color32::from_rgb(150, 158, 172)));
+                    ui.add_space(4.0);
+                    ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                        for (i, (key, _, dur_ms, n_seg, sample, proposed, sim)) in snapshot.iter().enumerate() {
+                            let mins = dur_ms / 60000;
+                            let secs = (dur_ms % 60000) / 1000;
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(key).strong().size(14.0));
+                                ui.label(
+                                    RichText::new(i18n::fill(tr.spoken_stat, &[&mins.to_string(), &secs.to_string(), &n_seg.to_string()]))
+                                        .size(11.5)
+                                        .color(Color32::from_rgb(150, 158, 172)),
+                                );
+                            });
+                            match (proposed, sim) {
+                                (Some(p), Some(s)) => {
+                                    ui.label(RichText::new(i18n::fill(tr.vp_prefill, &[p, &format!("{s:.2}")])).size(11.5).color(Color32::from_rgb(140, 200, 160)));
                                 }
+                                (Some(p), None) => {
+                                    ui.label(RichText::new(i18n::fill(tr.prefill, &[p])).size(11.5).color(Color32::from_rgb(140, 200, 160)));
+                                }
+                                _ => {}
                             }
-                        });
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(tr.confirm_naming).min_size(egui::vec2(150.0, 28.0))).clicked() {
-                    confirmed = true;
-                }
-                if ui.add(egui::Button::new(tr.btn_later)).clicked() {
-                    deferred = true;
-                }
-            });
-        });
+                            ui.label(RichText::new(i18n::fill(tr.sample, &[sample])).size(11.5).color(Color32::from_rgb(170, 176, 188)));
+                            ui.add(
+                                TextEdit::singleline(&mut inputs[i])
+                                    .hint_text(tr.input_name)
+                                    .desired_width(240.0),
+                            );
+                            if !known.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(tr.history).size(11.0).color(Color32::from_rgb(150, 158, 172)));
+                                    for kn in &known {
+                                        if ui.add(egui::Button::new(RichText::new(kn).size(11.0))).clicked() {
+                                            inputs[i] = kn.clone();
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(tr.confirm_naming).min_size(egui::vec2(150.0, 28.0))).clicked() {
+                            confirmed = true;
+                        }
+                        if ui.add(egui::Button::new(tr.btn_later)).clicked() {
+                            deferred = true;
+                        }
+                    });
+                },
+            );
+            (closed, confirmed, deferred)
+        },
+    );
 
-    app.show_naming = open;
+    if closed {
+        app.show_naming = false; // 保留 naming 数据,重开由 open_naming 重建
+    }
     if confirmed {
         let mid = meeting_id;
         let mut named = 0;
@@ -996,183 +1058,192 @@ fn paint_naming(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-// ---------- 设置窗 ----------
+// ---------- 设置窗(独立原生视口,egui::Window 会被 132×96 主视口裁剪) ----------
 
 fn paint_settings(app: &mut App, ctx: &egui::Context) {
-    let mut open = app.show_settings;
-    let mut save_clicked = false;
-    let mut cancel_clicked = false;
-
+    let vp = ViewportId(egui::Id::new("settings"));
     let tr = app.lang.strings();
-    egui::Window::new(tr.set_title)
-        .open(&mut open)
-        .resizable(false)
-        .collapsible(false)
-        .show(ctx, |ui| {
-            let Some(d) = app.draft.as_mut() else { return };
-            ScrollArea::vertical().max_height(430.0).show(ui, |ui| {
-                ui.heading(tr.sec_gateway);
-                let gw_alive = mrc_core::gateway::health(&app.cfg.gateway_url(), std::time::Duration::from_millis(800));
-                ui.label(
-                    RichText::new(if gw_alive { tr.gateway_online } else { tr.gateway_offline })
-                        .size(12.0)
-                        .color(if gw_alive { Color32::from_rgb(140, 200, 160) } else { Color32::from_rgb(240, 160, 90) }),
-                );
-                row(ui, tr.lbl_gateway_url, &mut d.gw_url, tr.hint_gateway_url);
-                ui.checkbox(&mut d.gw_auto_start, tr.lbl_gw_auto_start);
-                ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(tr.btn_gateway_start)).clicked() {
-                        let cfg = app.cfg.clone();
-                        std::thread::spawn(move || {
-                            match mrc_core::gateway::ensure(&cfg) {
-                                Ok(msg) => println!("[gateway] {msg}"),
-                                Err(e) => eprintln!("[gateway] {e:#}"),
-                            }
-                        });
-                    }
-                });
-                ui.separator();
-                ui.heading(tr.sec_whisper);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(tr.lbl_stt_provider).size(12.5));
-                    let mut prov = d.whisper_provider.clone();
-                    egui::ComboBox::from_id_salt("stt-provider")
-                        .selected_text(match prov.as_str() {
-                            "wanai" => "WanAI (local gw)",
-                            _ => "Local (whisper-rs)",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut prov, "local".to_string(), "Local (whisper-rs)");
-                            ui.selectable_value(&mut prov, "wanai".to_string(), "WanAI (local gw)");
-                        });
-                    d.whisper_provider = prov;
-                });
-                row(ui, tr.lbl_model, &mut d.whisper_model, tr.hint_model);
-                row(ui, tr.lbl_language, &mut d.whisper_lang, "zh / en / auto");
-                row(ui, tr.lbl_window, &mut d.whisper_window, "12");
-                ui.separator();
-                ui.heading(tr.sec_diarize);
-                ui.checkbox(&mut d.diarize_enabled, tr.lbl_diarize_on);
-                row(ui, tr.lbl_python, &mut d.diarize_python, "");
-                row(ui, tr.lbl_hf, &mut d.diarize_hf, tr.hint_hf);
-                ui.separator();
-                ui.heading(tr.sec_llm);
-                row(ui, tr.lbl_base, &mut d.llm_base, tr.hint_base);
-                row(ui, tr.lbl_key, &mut d.llm_key, "");
-                row(ui, tr.lbl_llm_model, &mut d.llm_model, tr.hint_llm_model);
-                ui.checkbox(&mut d.llm_schema, tr.lbl_schema);
-                row(ui, tr.lbl_ctx, &mut d.llm_ctx, "200000");
-                ui.separator();
-                ui.heading(tr.sec_subtitle);
-                ui.checkbox(&mut d.sub_enabled, tr.lbl_sub_on);
-                ui.checkbox(&mut d.sub_on_top, tr.lbl_sub_top);
-                row(ui, tr.lbl_sub_font, &mut d.sub_font, "26");
-                row(ui, tr.lbl_sub_opacity, &mut d.sub_opacity, "0.55");
-                row(ui, tr.lbl_sub_margin, &mut d.sub_margin, "48");
-                ui.separator();
-                ui.heading(tr.sec_window_post);
-                ui.checkbox(&mut d.main_on_top, tr.lbl_main_top);
-                row(ui, tr.lbl_shots_window, &mut d.shots_window, "30");
-                row(ui, tr.lbl_chunk_window, &mut d.chunk_window, "300");
-                row(ui, tr.lbl_chunk_tokens, &mut d.chunk_tokens, "1000");
-                row(ui, tr.lbl_rag, &mut d.rag_base, tr.hint_rag);
-                ui.separator();
-                ui.heading(tr.sec_translate);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(tr.lbl_tr_provider).size(12.5));
-                    let mut prov = d.tr_provider.clone();
-                    egui::ComboBox::from_id_salt("tr-provider")
-                        .selected_text(match prov.as_str() {
-                            "llm" => "LLM",
-                            "baidu" => "Baidu",
-                            "wanai" => "WanAI (local)",
-                            _ => "off",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut prov, "none".to_string(), "off");
-                            ui.selectable_value(&mut prov, "llm".to_string(), "LLM");
-                            ui.selectable_value(&mut prov, "baidu".to_string(), "Baidu");
-                            ui.selectable_value(&mut prov, "wanai".to_string(), "WanAI (local)");
-                        });
-                    d.tr_provider = prov;
-                });
-                row(ui, tr.lbl_tr_from, &mut d.tr_from, "zh");
-                row(ui, tr.lbl_tr_to, &mut d.tr_to, "en");
-                if d.tr_provider == "baidu" {
-                    row(ui, tr.lbl_tr_appid, &mut d.tr_appid, "");
-                    row(ui, tr.lbl_tr_secret, &mut d.tr_secret, "");
-                }
-                ui.separator();
-                ui.heading(tr.sec_shots);
-                row(ui, tr.lbl_shots_default, &mut d.shots_default_win, tr.hint_shots_default);
-                row(ui, tr.lbl_auto_shots, &mut d.shots_auto, "0");
-                ui.separator();
-                ui.heading(tr.sec_tools);
-                let pf_state = {
-                    let installed = mrc_core::tools::is_installed(&app.cfg).map(|p| p.display().to_string());
-                    let sibling = installed.is_none().then(|| mrc_core::tools::resolve_available(&app.cfg)).flatten();
-                    match (installed, sibling) {
-                        (Some(p), _) => i18n::fill(tr.pf_installed, &[&p]),
-                        (None, Some(p)) => i18n::fill(tr.pf_sibling, &[&p.display().to_string()]),
-                        (None, None) => tr.pf_missing.to_string(),
-                    }
-                };
-                ui.label(RichText::new(&pf_state).size(12.0).color(Color32::from_rgb(150, 158, 172)));
-                row(ui, tr.lbl_pf_src, &mut d.pf_url, tr.hint_pf);
-                // 界面语言(保存后生效;托盘文案需重启)
-                let mut lang_code = app.cfg.lang.clone().unwrap_or_default();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(tr.lbl_lang_ui).size(12.5));
-                    egui::ComboBox::from_id_salt("ui-lang")
-                        .selected_text(match lang_code.as_str() {
-                            "en" => "English",
-                            "de" => "Deutsch",
-                            "ja" => "日本語",
-                            _ => "中文",
-                        })
-                        .show_ui(ui, |ui| {
-                            for l in Lang::ALL {
-                                ui.selectable_value(&mut lang_code, l.code().to_string(), l.native_name());
-                            }
-                        });
-                });
-                d.lang_code = lang_code;
-                ui.horizontal(|ui| {
-                    let installing = app.pf_job.is_some();
-                    let label = if installing { tr.btn_installing } else { tr.btn_install };
-                    if ui.add_enabled(!installing, egui::Button::new(label)).clicked() {
-                        let src = d.pf_url.trim().to_string();
-                        let src = (!src.is_empty()).then_some(src);
-                        app.pf_job = Some(ToolJob::start(src));
-                    }
-                    if ui.button(tr.btn_launch_tool).clicked() {
-                        let tr2 = app.lang.strings();
-                        match mrc_core::tools::launch(&app.cfg) {
-                            Ok(p) => app.notice = Some((false, i18n::fill(tr2.tool_launch_ok, &[&p.display().to_string()]))),
-                            Err(e) => app.notice = Some((true, format!("{e:#}"))),
-                        }
-                    }
-                });
-                if let Some(job) = &app.pf_job {
-                    match &job.status {
-                        ToolStatus::Running => { ui.spinner(); ui.label(RichText::new(tr.tool_running).size(11.5)); }
-                        ToolStatus::Ok(p) => { ui.label(RichText::new(i18n::fill(tr.tool_done, &[&p.display().to_string()])).size(11.5).color(Color32::from_rgb(140,200,160))); }
-                        ToolStatus::Err(e) => { ui.label(RichText::new(e).size(11.5).color(Color32::from_rgb(240,120,120))); }
-                    }
-                }
-            }); // ScrollArea
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(tr.btn_save).min_size(egui::vec2(90.0, 26.0))).clicked() {
-                    save_clicked = true;
-                }
-                if ui.add(egui::Button::new(tr.btn_cancel)).clicked() {
-                    cancel_clicked = true;
-                }
-            });
-        });
+    let title = tr.set_title.to_string();
+    let on_top = app.cfg.main_on_top;
 
-    app.show_settings = open;
+    let (closed, save_clicked, cancel_clicked) = ctx.show_viewport_immediate(
+        vp,
+        egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            .with_inner_size(SETTINGS_SIZE)
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_window_level(if on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            })
+            .with_icon(std::sync::Arc::new(load_icon())),
+        |vctx, _class| {
+            let mut save_clicked = false;
+            let mut cancel_clicked = false;
+            let closed = dialog_shell(
+                vctx,
+                vp,
+                &title,
+                |ui| {
+                    let Some(d) = app.draft.as_mut() else { return };
+                    ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                        ui.heading(tr.sec_gateway);
+                        let gw_alive = mrc_core::gateway::health(&app.cfg.gateway_url(), std::time::Duration::from_millis(800));
+                        ui.label(
+                            RichText::new(if gw_alive { tr.gateway_online } else { tr.gateway_offline })
+                                .size(12.0)
+                                .color(if gw_alive { Color32::from_rgb(140, 200, 160) } else { Color32::from_rgb(240, 160, 90) }),
+                        );
+                        row(ui, tr.lbl_gateway_url, &mut d.gw_url, tr.hint_gateway_url);
+                        ui.checkbox(&mut d.gw_auto_start, tr.lbl_gw_auto_start);
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(tr.btn_gateway_start)).clicked() {
+                                let cfg = app.cfg.clone();
+                                std::thread::spawn(move || {
+                                    match mrc_core::gateway::ensure(&cfg) {
+                                        Ok(msg) => println!("[gateway] {msg}"),
+                                        Err(e) => eprintln!("[gateway] {e:#}"),
+                                    }
+                                });
+                            }
+                        });
+                        ui.separator();
+                        ui.heading(tr.sec_stt);
+                        row(ui, tr.lbl_language, &mut d.stt_lang, "zh / en / auto");
+                        row(ui, tr.lbl_window, &mut d.stt_window, "12");
+                        ui.separator();
+                        ui.heading(tr.sec_diarize);
+                        ui.checkbox(&mut d.diarize_enabled, tr.lbl_diarize_on);
+                        row(ui, tr.lbl_python, &mut d.diarize_python, "");
+                        row(ui, tr.lbl_hf, &mut d.diarize_hf, tr.hint_hf);
+                        ui.separator();
+                        ui.heading(tr.sec_llm);
+                        row(ui, tr.lbl_base, &mut d.llm_base, tr.hint_base);
+                        row(ui, tr.lbl_key, &mut d.llm_key, "");
+                        row(ui, tr.lbl_llm_model, &mut d.llm_model, tr.hint_llm_model);
+                        ui.checkbox(&mut d.llm_schema, tr.lbl_schema);
+                        row(ui, tr.lbl_ctx, &mut d.llm_ctx, "200000");
+                        ui.separator();
+                        ui.heading(tr.sec_subtitle);
+                        ui.checkbox(&mut d.sub_enabled, tr.lbl_sub_on);
+                        ui.checkbox(&mut d.sub_on_top, tr.lbl_sub_top);
+                        row(ui, tr.lbl_sub_font, &mut d.sub_font, "26");
+                        row(ui, tr.lbl_sub_opacity, &mut d.sub_opacity, "0.55");
+                        row(ui, tr.lbl_sub_margin, &mut d.sub_margin, "48");
+                        ui.separator();
+                        ui.heading(tr.sec_window_post);
+                        ui.checkbox(&mut d.main_on_top, tr.lbl_main_top);
+                        row(ui, tr.lbl_shots_window, &mut d.shots_window, "30");
+                        row(ui, tr.lbl_chunk_window, &mut d.chunk_window, "300");
+                        row(ui, tr.lbl_chunk_tokens, &mut d.chunk_tokens, "1000");
+                        row(ui, tr.lbl_rag, &mut d.rag_base, tr.hint_rag);
+                        ui.separator();
+                        ui.heading(tr.sec_translate);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr.lbl_tr_provider).size(12.5));
+                            let mut prov = d.tr_provider.clone();
+                            egui::ComboBox::from_id_salt("tr-provider")
+                                .selected_text(match prov.as_str() {
+                                    "llm" => "LLM",
+                                    "baidu" => "Baidu",
+                                    "wanai" => "WanAI (local)",
+                                    _ => "off",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut prov, "none".to_string(), "off");
+                                    ui.selectable_value(&mut prov, "llm".to_string(), "LLM");
+                                    ui.selectable_value(&mut prov, "baidu".to_string(), "Baidu");
+                                    ui.selectable_value(&mut prov, "wanai".to_string(), "WanAI (local)");
+                                });
+                            d.tr_provider = prov;
+                        });
+                        row(ui, tr.lbl_tr_from, &mut d.tr_from, "zh");
+                        row(ui, tr.lbl_tr_to, &mut d.tr_to, "en");
+                        if d.tr_provider == "baidu" {
+                            row(ui, tr.lbl_tr_appid, &mut d.tr_appid, "");
+                            row(ui, tr.lbl_tr_secret, &mut d.tr_secret, "");
+                        }
+                        ui.separator();
+                        ui.heading(tr.sec_shots);
+                        row(ui, tr.lbl_shots_default, &mut d.shots_default_win, tr.hint_shots_default);
+                        row(ui, tr.lbl_auto_shots, &mut d.shots_auto, "0");
+                        ui.separator();
+                        ui.heading(tr.sec_tools);
+                        let pf_state = {
+                            let installed = mrc_core::tools::is_installed(&app.cfg).map(|p| p.display().to_string());
+                            let sibling = installed.is_none().then(|| mrc_core::tools::resolve_available(&app.cfg)).flatten();
+                            match (installed, sibling) {
+                                (Some(p), _) => i18n::fill(tr.pf_installed, &[&p]),
+                                (None, Some(p)) => i18n::fill(tr.pf_sibling, &[&p.display().to_string()]),
+                                (None, None) => tr.pf_missing.to_string(),
+                            }
+                        };
+                        ui.label(RichText::new(&pf_state).size(12.0).color(Color32::from_rgb(150, 158, 172)));
+                        row(ui, tr.lbl_pf_src, &mut d.pf_url, tr.hint_pf);
+                        // 界面语言(保存后生效;托盘文案需重启)
+                        let mut lang_code = app.cfg.lang.clone().unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr.lbl_lang_ui).size(12.5));
+                            egui::ComboBox::from_id_salt("ui-lang")
+                                .selected_text(match lang_code.as_str() {
+                                    "en" => "English",
+                                    "de" => "Deutsch",
+                                    "ja" => "日本語",
+                                    _ => "中文",
+                                })
+                                .show_ui(ui, |ui| {
+                                    for l in Lang::ALL {
+                                        ui.selectable_value(&mut lang_code, l.code().to_string(), l.native_name());
+                                    }
+                                });
+                        });
+                        d.lang_code = lang_code;
+                        ui.horizontal(|ui| {
+                            let installing = app.pf_job.is_some();
+                            let label = if installing { tr.btn_installing } else { tr.btn_install };
+                            if ui.add_enabled(!installing, egui::Button::new(label)).clicked() {
+                                let src = d.pf_url.trim().to_string();
+                                let src = (!src.is_empty()).then_some(src);
+                                app.pf_job = Some(ToolJob::start(src));
+                            }
+                            if ui.button(tr.btn_launch_tool).clicked() {
+                                let tr2 = app.lang.strings();
+                                match mrc_core::tools::launch(&app.cfg) {
+                                    Ok(p) => app.notice = Some((false, i18n::fill(tr2.tool_launch_ok, &[&p.display().to_string()]))),
+                                    Err(e) => app.notice = Some((true, format!("{e:#}"))),
+                                }
+                            }
+                        });
+                        if let Some(job) = &app.pf_job {
+                            match &job.status {
+                                ToolStatus::Running => { ui.spinner(); ui.label(RichText::new(tr.tool_running).size(11.5)); }
+                                ToolStatus::Ok(p) => { ui.label(RichText::new(i18n::fill(tr.tool_done, &[&p.display().to_string()])).size(11.5).color(Color32::from_rgb(140,200,160))); }
+                                ToolStatus::Err(e) => { ui.label(RichText::new(e).size(11.5).color(Color32::from_rgb(240,120,120))); }
+                            }
+                        }
+                    }); // ScrollArea
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(tr.btn_save).min_size(egui::vec2(90.0, 26.0))).clicked() {
+                            save_clicked = true;
+                        }
+                        if ui.add(egui::Button::new(tr.btn_cancel)).clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                },
+            );
+            (closed, save_clicked, cancel_clicked)
+        },
+    );
+
+    if closed {
+        app.show_settings = false; // ✕ 关闭,草稿保留(与取消不同)
+    }
     if cancel_clicked {
         app.draft = None;
         app.show_settings = false;

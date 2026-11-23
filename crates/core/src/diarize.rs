@@ -79,7 +79,7 @@ pub fn run(cfg: &Config, wav: &Path) -> Result<DiarizeResult> {
 }
 
 /// 把 diarization 段按时间重叠合并进 segments(整段替换 speaker;
-/// whisper 段与 diar 段取重叠最大者)。
+/// 转写段与 diar 段取重叠最大者)。
 pub fn merge_into_segments(
     conn: &Connection,
     meeting_id: i64,
