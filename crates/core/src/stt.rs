@@ -136,7 +136,8 @@ pub fn install_model(cfg: &Config) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn download(url: &str, dest: &Path) -> Result<()> {
+/// 下载文件到指定路径(.part 临时文件 + content-length 校验;diarize 模块复用)
+pub(crate) fn download(url: &str, dest: &Path) -> Result<()> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
         .timeout_read(Duration::from_secs(120))

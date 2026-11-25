@@ -15,6 +15,7 @@ use crate::chunk::{self, Chunk};
 use crate::config::Config;
 use crate::db::{self, Segment};
 use crate::diarize;
+use crate::diarize_refine;
 use crate::llm::{self, LlmClient};
 use crate::package::{self, PackageInput};
 use crate::rag::{self, RagClient};
@@ -84,13 +85,13 @@ pub fn run(
             .with_context(|| format!("会议#{meeting_id} 还没结束,不能后处理"))?;
         let mut segs = db::load_segments(conn, meeting_id)?;
 
-        // ---- 1. diarization(只在 segments 还没说话人时跑一次) ----
+        // ---- 1. diarization(只在 segments 还没说话人时跑一次;双流 + 跨流合并) ----
         let mut diar_embeddings: BTreeMap<String, Vec<f32>> = BTreeMap::new();
         let mut diarized = false;
         let has_speaker = segs.iter().any(|s| s.speaker.is_some());
         if !has_speaker && cfg.diarize.enabled {
-            if let Some(audio) = meeting.audio_path.clone() {
-                match diarize::run(cfg, std::path::Path::new(&audio)) {
+            if meeting.audio_path.is_some() || meeting.audio_remote_path.is_some() {
+                match diarize::run_dual(cfg, meeting.audio_path.as_deref(), meeting.audio_remote_path.as_deref()) {
                     Ok(d) => {
                         let n = diarize::merge_into_segments(conn, meeting_id, &d, meeting.started_at)?;
                         diar_embeddings = d.embeddings.clone();
@@ -104,6 +105,22 @@ pub fn run(
                 }
             }
         }
+
+        // ---- 1.5 语言线索纠偏(短应答继承/回合约束/称呼反推) ----
+        let vocatives = {
+            let report = diarize_refine::refine(&segs);
+            for (idx, spk) in &report.changes {
+                conn.execute(
+                    "UPDATE segments SET speaker=?1 WHERE meeting_id=?2 AND idx=?3",
+                    rusqlite::params![spk, meeting_id, idx],
+                )?;
+            }
+            if !report.changes.is_empty() {
+                eprintln!("[pipeline] 语言线索纠偏: 短应答继承 {} + 回合归并 {} 处", report.inherited, report.flipped);
+                segs = db::load_segments(conn, meeting_id)?;
+            }
+            report.vocatives
+        };
 
         // ---- 2. 声纹比对预填 + 命名 ----
         // speakers 表 = 已登记键 ∪ segments 中出现的键(部分登记/重跑均收敛);
@@ -133,7 +150,11 @@ pub fn run(
 
         for key in &speaker_keys {
             if let Some(emb) = diar_embeddings.get(key) {
-                if let Some(m) = diarize::match_voiceprint(conn, emb)? {
+                if let Some(m) = diarize::match_voiceprint(conn, emb, diarize::EMBEDDING_MODEL_ID)? {
+                    // 称呼反推约束:喊"X总"的簇不预填"X总"
+                    if vocatives.iter().any(|(n, k)| k == key && n == &m.name) {
+                        continue;
+                    }
                     let certain = m.similarity >= cfg.post.voiceprint_match;
                     let proposed = if certain || m.similarity >= cfg.post.voiceprint_uncertain {
                         Some(m.name.clone())
@@ -209,7 +230,7 @@ pub fn run(
         let speakers = db::load_speakers(conn, meeting_id)?;
         for (key, name, _, _) in &speakers {
             if let (Some(nm), Some(emb)) = (name, diar_embeddings.get(key)) {
-                diarize::register_voiceprint(conn, nm, emb, meeting_id, cfg.post.voiceprint_max_samples)?;
+                diarize::register_voiceprint(conn, nm, emb, meeting_id, cfg.post.voiceprint_max_samples, diarize::EMBEDDING_MODEL_ID)?;
             }
         }
 

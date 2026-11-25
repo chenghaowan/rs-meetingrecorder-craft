@@ -151,16 +151,24 @@ pub fn run(action: CliAction) -> i32 {
                 1
             }
         },
-        CliAction::FetchModels => match mrc_core::stt::install_model(&cfg) {
-            Ok(p) => {
-                println!("models: {}", p.display());
-                0
-            }
-            Err(e) => {
+        CliAction::FetchModels => {
+            let mut ok = true;
+            if let Err(e) = mrc_core::stt::install_model(&cfg) {
                 eprintln!("错误: {e:#}");
+                ok = false;
+            }
+            // diarization 模型(约 34 MB;缺失会在 pipeline 阶段自动补)
+            if let Err(e) = mrc_core::diarize::ensure_models(&cfg) {
+                eprintln!("错误: {e:#}");
+                ok = false;
+            }
+            if ok {
+                println!("models: {}", cfg.data_dir().join("models").display());
+                0
+            } else {
                 1
             }
-        },
+        }
         CliAction::ShotWindow { keyword, ocr } => match shot_window(&cfg, &keyword, ocr) {
             Ok(v) => {
                 println!("{v}");

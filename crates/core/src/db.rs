@@ -72,6 +72,18 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_remote_path {
         conn.execute_batch("ALTER TABLE meetings ADD COLUMN audio_remote_path TEXT;")?;
     }
+    // v0.1.2:声纹质心带嵌入模型标识(跨模型不比对;旧 pyannote 质心为 NULL 自然排除)
+    let has_vp_model: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('voiceprints') WHERE name='embedding_model'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_vp_model {
+        conn.execute_batch("ALTER TABLE voiceprints ADD COLUMN embedding_model TEXT;")?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meetings (
            id           INTEGER PRIMARY KEY AUTOINCREMENT,

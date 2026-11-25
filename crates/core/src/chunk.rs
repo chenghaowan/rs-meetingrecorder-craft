@@ -79,6 +79,7 @@ mod tests {
             start_ms: start,
             end_ms: start + 1000,
             speaker: Some("SPEAKER_00".into()),
+            source: Some("mic".into()),
             text: text.into(),
             translation: String::new(),
         }

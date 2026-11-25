@@ -139,8 +139,6 @@ struct Draft {
     stt_lang: String,
     stt_window: String,
     diarize_enabled: bool,
-    diarize_python: String,
-    diarize_hf: String,
     llm_base: String,
     llm_key: String,
     llm_model: String,
@@ -173,8 +171,6 @@ impl Draft {
             stt_lang: c.stt.language.clone(),
             stt_window: c.stt.window_secs.to_string(),
             diarize_enabled: c.diarize.enabled,
-            diarize_python: c.diarize.python.clone().unwrap_or_default(),
-            diarize_hf: c.diarize.hf_token.clone().unwrap_or_default(),
             llm_base: c.llm.base_url.clone(),
             llm_key: c.llm.api_key.clone(),
             llm_model: c.llm.model.clone(),
@@ -211,8 +207,6 @@ impl Draft {
         c.stt.language = if self.stt_lang.trim().is_empty() { "zh".into() } else { self.stt_lang.trim().into() };
         c.stt.window_secs = self.parse(&self.stt_window, c.stt.window_secs).max(4.0);
         c.diarize.enabled = self.diarize_enabled;
-        c.diarize.python = (!self.diarize_python.trim().is_empty()).then(|| self.diarize_python.trim().into());
-        c.diarize.hf_token = (!self.diarize_hf.trim().is_empty()).then(|| self.diarize_hf.trim().into());
         c.llm.base_url = self.llm_base.trim().to_string();
         c.llm.api_key = self.llm_key.trim().to_string();
         c.llm.model = if self.llm_model.trim().is_empty() { c.llm.model.clone() } else { self.llm_model.trim().into() };
@@ -1147,8 +1141,6 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                         ui.separator();
                         ui.heading(tr.sec_diarize);
                         ui.checkbox(&mut d.diarize_enabled, tr.lbl_diarize_on);
-                        row(ui, tr.lbl_python, &mut d.diarize_python, "");
-                        row(ui, tr.lbl_hf, &mut d.diarize_hf, tr.hint_hf);
                         ui.separator();
                         ui.heading(tr.sec_llm);
                         row(ui, tr.lbl_base, &mut d.llm_base, tr.hint_base);

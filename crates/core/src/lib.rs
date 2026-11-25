@@ -11,6 +11,7 @@ pub mod chunk;
 pub mod config;
 pub mod db;
 pub mod diarize;
+pub mod diarize_refine;
 pub mod llm;
 pub mod package;
 pub mod pipeline;

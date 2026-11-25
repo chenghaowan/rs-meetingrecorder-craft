@@ -135,6 +135,7 @@ mod tests {
             start_ms: 920_000,
             end_ms: 940_000,
             speaker: Some("Frank".into()),
+            source: Some("mic".into()),
             text: "这里有缩水风险,建议增加偷胶".into(),
             translation: String::new(),
         };

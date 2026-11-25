@@ -37,21 +37,17 @@ impl Default for SttCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiarizeCfg {
-    /// python 解释器(跑 scripts/diarize.py);留空=自动找 PATH 上的 python
-    pub python: Option<String>,
-    /// diarize.py 绝对路径;留空=exe 目录 scripts\diarize.py、cwd scripts\diarize.py
-    pub script: Option<PathBuf>,
-    /// HuggingFace token(pyannote 模型需要,首次同意条款后填)
-    pub hf_token: Option<String>,
     /// 失败/未配置时:跳过说话人分离,转写保持 SPEAKER 缺省
     pub enabled: bool,
-    /// 超时(秒)
-    pub timeout_secs: u64,
+    /// 聚类阈值(簇数未知走阈值模式;越小簇越少)
+    pub threshold: f32,
+    /// 跨流(mic/remote)簇质心合并的余弦阈值
+    pub cross_match: f32,
 }
 
 impl Default for DiarizeCfg {
     fn default() -> Self {
-        Self { python: None, script: None, hf_token: None, enabled: true, timeout_secs: 600 }
+        Self { enabled: true, threshold: 0.5, cross_match: 0.4 }
     }
 }
 
@@ -278,13 +274,7 @@ impl Default for Config {
             packages_dir: None,
             stt: SttCfg::default(),
             capture: CaptureCfg::default(),
-            diarize: DiarizeCfg {
-                python: None,
-                script: None,
-                hf_token: None,
-                enabled: true,
-                timeout_secs: 600,
-            },
+            diarize: DiarizeCfg::default(),
             llm: LlmCfg {
                 base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
                 api_key: String::new(),
