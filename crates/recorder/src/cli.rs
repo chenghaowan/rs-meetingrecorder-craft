@@ -310,7 +310,8 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
     let cfg2 = cfg.clone();
     let shared2 = shared.clone();
     let remote_shared2 = remote_shared.clone();
-    let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+    let dd = cfg2.data_dir();
+    let translator = Translator::new(&cfg2.translate, &cfg2.llm, Some(dd.as_path())).ok();
     let asr = LocalAsr::from_config(&cfg2).ok().flatten().map(Arc::new);
     let vad = match mrc_core::stt::VadStream::from_config(&cfg2) {
         Ok(v) => v,

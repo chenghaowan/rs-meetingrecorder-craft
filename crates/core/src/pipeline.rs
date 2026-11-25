@@ -201,7 +201,8 @@ pub fn run(
                 .map(|s| s.idx)
                 .collect();
             if !untranslated.is_empty() {
-                match Translator::new(&cfg.translate, &cfg.llm) {
+                let dd = cfg.data_dir();
+                match Translator::new(&cfg.translate, &cfg.llm, Some(dd.as_path())) {
                     Ok(tr) if tr.enabled() => {
                         let texts: Vec<String> = segs
                             .iter()

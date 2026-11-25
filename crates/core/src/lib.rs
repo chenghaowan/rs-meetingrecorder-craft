@@ -21,6 +21,7 @@ pub mod stt;
 pub mod tokens;
 pub mod tools;
 pub mod translate;
+pub mod translate_server;
 pub mod windowcap;
 pub mod transcribe;
 

@@ -198,11 +198,32 @@ pub struct Config {
     pub tools: ToolsCfg,
 }
 
+/// 本地翻译服务(llama-server + Hy-MT3 GGUF,Vulkan GPU)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalTranslateCfg {
+    /// llama-server.exe 路径;留空自动找 data_dir\tools\llama-vulkan
+    pub server_exe: Option<PathBuf>,
+    /// GGUF 模型路径;留空自动找 data_dir\models\hy-mt3\*.gguf
+    pub model_path: Option<PathBuf>,
+    pub port: u16,
+    /// GPU 卸载层数(99=全部)
+    pub ngl: i32,
+    /// 上下文窗口
+    pub ctx: u32,
+}
+
+impl Default for LocalTranslateCfg {
+    fn default() -> Self {
+        Self { server_exe: None, model_path: None, port: 17810, ngl: 99, ctx: 4096 }
+    }
+}
+
 /// 字幕实时翻译配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TranslateCfg {
-    /// "llm"(复用 [llm] 端点) | "baidu" | "none"
+    /// "local"(llama-server + Hy-MT3,本机 GPU) | "llm"(复用 [llm] 端点) | "baidu" | "none"
     pub provider: String,
     pub from_lang: String,
     pub to_lang: String,
@@ -212,6 +233,8 @@ pub struct TranslateCfg {
     pub appid: String,
     pub secret: String,
     pub api_url: String,
+    /// local provider 参数
+    pub local: LocalTranslateCfg,
 }
 
 impl Default for TranslateCfg {
@@ -224,6 +247,7 @@ impl Default for TranslateCfg {
             appid: String::new(),
             secret: String::new(),
             api_url: "https://fanyi-api.baidu.com/api/trans/vip/translate".into(),
+            local: LocalTranslateCfg::default(),
         }
     }
 }

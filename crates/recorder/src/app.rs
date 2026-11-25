@@ -226,7 +226,7 @@ impl Draft {
         c.lang = Some(self.lang_code.clone()).filter(|s| !s.is_empty());
         let prov = self.tr_provider.trim();
         c.translate.provider = match prov {
-            "llm" | "baidu" => prov.to_string(),
+            "local" | "llm" | "baidu" => prov.to_string(),
             _ => "none".to_string(),
         };
         c.translate.from_lang = if self.tr_from.trim().is_empty() { "zh".into() } else { self.tr_from.trim().into() };
@@ -385,7 +385,8 @@ impl App {
         let live2 = std::sync::Arc::clone(&self.live);
         let shared2 = shared.clone();
         let remote_shared2 = remote_shared.clone();
-        let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+        let dd = cfg2.data_dir();
+        let translator = Translator::new(&cfg2.translate, &cfg2.llm, Some(dd.as_path())).ok();
         let asr = LocalAsr::from_config(&cfg2).ok().flatten().map(std::sync::Arc::new);
         let vad = match mrc_core::stt::VadStream::from_config(&cfg2) {
             Ok(v) => v,
@@ -1169,12 +1170,14 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                             let mut prov = d.tr_provider.clone();
                             egui::ComboBox::from_id_salt("tr-provider")
                                 .selected_text(match prov.as_str() {
+                                    "local" => "Local (Hy-MT3)",
                                     "llm" => "LLM",
                                     "baidu" => "Baidu",
                                     _ => "off",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut prov, "none".to_string(), "off");
+                                    ui.selectable_value(&mut prov, "local".to_string(), "Local (Hy-MT3)");
                                     ui.selectable_value(&mut prov, "llm".to_string(), "LLM");
                                     ui.selectable_value(&mut prov, "baidu".to_string(), "Baidu");
                                 });

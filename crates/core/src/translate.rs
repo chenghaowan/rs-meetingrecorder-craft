@@ -1,31 +1,41 @@
-//! 字幕实时翻译,双 provider:
+//! 字幕实时翻译,三 provider:
+//! - "local":llama-server + Hy-MT3(本机 Vulkan GPU,官方模板逐段直翻,离线)
 //! - "llm":复用 [llm] 的 OpenAI 兼容端点。编号批量翻译,一次调用翻 3~5 段,术语保留。
 //! - "baidu":移植 ltl-manage utils/translator.py 的百度翻译开放 API
 //!   (appid+secret MD5 签名,兼容经典/AI 两种响应格式,进程内缓存)。
 //!
-//! 两种 provider 共用一层文本缓存(键 = provider|from|to|text)。
+//! 各 provider 共用一层文本缓存(键 = provider|from|to|text)。
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 
 use crate::config::{LlmCfg, TranslateCfg};
+use crate::translate_server::{self, LocalServer};
 
 const CACHE_MAX: usize = 2000;
 
 pub struct Translator {
     cfg: TranslateCfg,
     llm: Option<LlmCfg>,
+    /// local provider 的服务进程句柄(drop 即 kill 自启进程)
+    server: Option<LocalServer>,
     agent: ureq::Agent,
     cache: Mutex<HashMap<String, String>>,
 }
 
 impl Translator {
-    pub fn new(cfg: &TranslateCfg, llm: &LlmCfg) -> Result<Self> {
+    pub fn new(cfg: &TranslateCfg, llm: &LlmCfg, data_dir: Option<&Path>) -> Result<Self> {
+        let mut server = None;
         match cfg.provider.as_str() {
             "none" | "" => bail!("翻译未启用"),
+            "local" => {
+                // 就绪即持有句柄;失败即禁用(调用方降级)
+                server = Some(translate_server::ensure(&cfg.local, data_dir)?);
+            }
             "llm" => {
                 if llm.api_key.is_empty() {
                     bail!("provider=llm 但 [llm] api_key 未配置");
@@ -36,11 +46,12 @@ impl Translator {
                     bail!("provider=baidu 但 [translate] appid/secret 未配置");
                 }
             }
-            other => bail!("未知翻译 provider: {other}(llm/baidu/none)"),
+            other => bail!("未知翻译 provider: {other}(local/llm/baidu/none)"),
         }
         Ok(Self {
             cfg: cfg.clone(),
             llm: Some(llm.clone()),
+            server,
             agent: ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(30))
                 .build(),
@@ -79,6 +90,7 @@ impl Translator {
 
         // 2) 未命中的按 provider 翻
         let res = match self.cfg.provider.as_str() {
+            "local" => self.translate_batch_local(texts, &pending),
             "baidu" => self.translate_batch_baidu(texts, &pending),
             _ => self.translate_batch_llm(texts, &pending),
         };
@@ -103,6 +115,31 @@ impl Translator {
 
     fn cache_key(&self, text: &str) -> String {
         format!("{}|{}|{}|{}", self.cfg.provider, self.cfg.from_lang, self.cfg.to_lang, text)
+    }
+
+    // ---------- local provider:Hy-MT3 逐段直翻(官方模板) ----------
+
+    fn translate_batch_local(
+        &self,
+        texts: &[String],
+        idxs: &[usize],
+    ) -> Result<Vec<Option<String>>> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| anyhow!("local 翻译服务未就绪"))?;
+        let target = lang_name(&self.cfg.to_lang);
+        let mut values: Vec<Option<String>> = vec![None; idxs.len()];
+        for (k, i) in idxs.iter().enumerate() {
+            match translate_server::translate_one(&server.base_url, &self.agent, &texts[*i], target) {
+                Ok(v) => values[k] = Some(v),
+                Err(e) => {
+                    eprintln!("[translate] local 失败: {e}");
+                    break; // 连续失败放弃本批,下个 tick 再试
+                }
+            }
+        }
+        Ok(values)
     }
 
     // ---------- llm provider:编号批量,一次调用 ----------
@@ -244,10 +281,10 @@ pub fn chat_text(llm: &LlmCfg, agent: &ureq::Agent, system: &str, user: &str) ->
 fn lang_name(code: &str) -> &'static str {
     match code {
         "zh" => "简体中文",
-        "en" => "English",
-        "de" => "Deutsch",
-        "ja" => "日本語",
-        _ => "English",
+        "en" => "英文",
+        "de" => "德文",
+        "ja" => "日文",
+        _ => "英文",
     }
 }
 
@@ -264,6 +301,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .is_err());
         assert!(Translator::new(
@@ -272,6 +310,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .is_err());
         assert!(Translator::new(
@@ -280,6 +319,7 @@ mod tests {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         )
         .is_err());
     }
@@ -294,7 +334,7 @@ mod tests {
             secret: "s".into(),
             ..Default::default()
         };
-        let t = Translator::new(&cfg, &Default::default()).unwrap();
+        let t = Translator::new(&cfg, &Default::default(), None).unwrap();
         assert!(t.cache_key("你好").starts_with("baidu|zh|en|"));
     }
 }
