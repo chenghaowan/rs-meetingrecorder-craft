@@ -187,16 +187,15 @@ fn cmd_transcribe(cfg: &Config, wav: &str) -> Result<serde_json::Value> {
     let dur = samples.len() as f64 / 16000.0;
     let asr = LocalAsr::from_config(cfg)?
         .ok_or_else(|| anyhow::anyhow!("STT 未启用(provider=none);模型缺失时先跑 mrc-recorder --fetch-models"))?;
+    let mut vad = match mrc_core::stt::VadStream::from_config(cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[stt] VAD 不可用,整段转写: {e:#}");
+            None
+        }
+    };
     let t0 = std::time::Instant::now();
-    let segs = asr
-        .transcribe(16000, &samples)?
-        .into_iter()
-        .map(|s| mrc_core::transcribe::RawSegment {
-            start_ms: s.start_ms,
-            end_ms: s.end_ms,
-            text: s.text,
-        })
-        .collect::<Vec<_>>();
+    let segs = mrc_core::transcribe::transcribe_offline(&asr, vad.as_mut(), &samples)?;
     let elapsed = t0.elapsed().as_secs_f64();
     let items: Vec<serde_json::Value> = segs
         .iter()
@@ -290,8 +289,15 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
     let shared2 = shared.clone();
     let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
     let asr = LocalAsr::from_config(&cfg2).ok().flatten().map(Arc::new);
+    let vad = match mrc_core::stt::VadStream::from_config(&cfg2) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[stt] VAD 不可用,回退固定窗口切句: {e:#}");
+            None
+        }
+    };
     std::thread::spawn(move || {
-        let mut streaming = Streaming::new(asr, cfg2.stt.window_secs);
+        let mut streaming = Streaming::new(asr, vad, cfg2.stt.window_secs);
         let mut idx: i64 = 0;
         let res = (|| -> Result<()> {
             let conn = db::open(&cfg2.db_path())?;
@@ -326,7 +332,7 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
                 }
                 std::thread::sleep(Duration::from_millis(2000));
             }
-            if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.tick(&shared2) {
+            if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.drain(&shared2) {
                 for s in &segs {
                     db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
                 }

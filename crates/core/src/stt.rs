@@ -23,6 +23,11 @@ const TOKENS_FILE: &str = "tokens.txt";
 const HF_REPO: &str = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 const HF_MIRROR: &str = "https://hf-mirror.com";
 
+const VAD_FILE: &str = "silero_vad.onnx";
+/// silero-vad v5(sherpa-onnx 转换版,MIT,~630 KB):体积小到直接内嵌进二进制,
+/// 首次使用落盘 data_dir\models\vad,免去一次网络下载
+const VAD_EMBEDDED: &[u8] = include_bytes!("../assets/silero_vad.onnx");
+
 /// 已落库确定的转写段(会议相对毫秒,由调用方加窗口起点)
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -113,7 +118,7 @@ pub fn resolve_dir(cfg: &Config) -> Option<PathBuf> {
     })
 }
 
-/// 下载模型到 data_dir/models/sensevoice(可重复执行,已存在的文件跳过)
+/// 下载模型到 data_dir/models/(sensevoice + silero-vad;可重复执行,已存在的文件跳过)
 pub fn install_model(cfg: &Config) -> Result<PathBuf> {
     let dir = cfg.data_dir().join("models").join("sensevoice");
     std::fs::create_dir_all(&dir)
@@ -127,7 +132,7 @@ pub fn install_model(cfg: &Config) -> Result<PathBuf> {
         let url = format!("{HF_MIRROR}/{HF_REPO}/resolve/main/{file}");
         download(&url, &dest)?;
     }
-    eprintln!("[stt] SenseVoice 模型就绪: {}", dir.display());
+    eprintln!("[stt] 模型就绪: {}(VAD 内嵌随包,无需下载)", dir.display());
     Ok(dir)
 }
 
@@ -183,4 +188,122 @@ pub fn status(cfg: &Config) -> Result<String, String> {
 /// 便捷:provider 是否启用
 pub fn enabled(cfg: &SttCfg) -> bool {
     !cfg.provider.trim().eq_ignore_ascii_case("none") && !cfg.provider.trim().is_empty()
+}
+
+// ---------- silero-vad 切句 ----------
+
+/// VAD 模型目录候选(与 sensevoice 同级:data_dir\models\vad)
+fn vad_candidates(cfg: &Config) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(p) = cfg.stt.model_dir.clone() {
+        v.push(p.parent().map(|d| d.join("vad")).unwrap_or_else(|| p.clone()));
+    }
+    v.push(cfg.data_dir().join("models").join("vad"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("models").join("vad"));
+        }
+    }
+    v.push(PathBuf::from("models").join("vad"));
+    v
+}
+
+/// 找到含 silero_vad.onnx 的目录
+pub fn resolve_vad(cfg: &Config) -> Option<PathBuf> {
+    vad_candidates(cfg).into_iter().find(|d| d.join(VAD_FILE).is_file())
+}
+
+/// 保证 silero_vad.onnx 就绪:已存在直接用;缺失则把内嵌模型落盘到 data_dir\models\vad。
+pub fn ensure_vad(cfg: &Config) -> Result<PathBuf> {
+    if let Some(dir) = resolve_vad(cfg) {
+        return Ok(dir.join(VAD_FILE));
+    }
+    let dir = cfg.data_dir().join("models").join("vad");
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(VAD_FILE);
+    if !dest.is_file() {
+        std::fs::write(&dest, VAD_EMBEDDED)
+            .with_context(|| format!("写入内嵌 VAD 模型失败: {}", dest.display()))?;
+    }
+    Ok(dest)
+}
+
+/// VAD 检测窗口(样本数):sherpa-onnx 把单次 AcceptWaveform 内的全部窗口
+/// OR 成一个 is_speech,必须逐窗喂,否则段起点会被裁到块尾
+const VAD_WINDOW_SIZE: i32 = 512;
+
+/// VAD 切句器:喂 16k mono f32,弹完整语音段。流式、线程内独占使用。
+///
+/// 时间轴:`next_segment` 返回的起始样本索引相对 VAD 建立起累计,
+/// 调用方用"首个喂入块的会议相对毫秒"做原点换算(见 transcribe::Streaming)。
+pub struct VadStream {
+    vad: sherpa_rs::silero_vad::SileroVad,
+    fed: u64,
+    consumed: u64,
+}
+
+impl VadStream {
+    /// 内嵌模型兜底,几乎不会失败
+    pub fn from_config(cfg: &Config) -> Result<Option<Self>> {
+        let model = ensure_vad(cfg)?;
+        Ok(Some(Self::new(&model)?))
+    }
+
+    pub fn new(model: &Path) -> Result<Self> {
+        if !model.is_file() {
+            bail!("VAD 模型缺失: {}", model.display());
+        }
+        let vad = sherpa_rs::silero_vad::SileroVad::new(
+            sherpa_rs::silero_vad::SileroVadConfig {
+                model: model.display().to_string(),
+                // 切句参数:句尾 0.5s 静音判停;最短 0.25s;最长 20s(长发言强制切,
+                // 字幕不拖);默认窗口 512 样本 @16k
+                min_silence_duration: 0.5,
+                min_speech_duration: 0.25,
+                max_speech_duration: 20.0,
+                threshold: 0.5,
+                sample_rate: crate::capture::TARGET_RATE,
+                window_size: VAD_WINDOW_SIZE,
+                ..Default::default()
+            },
+            60.0, // 内部环形缓冲 60s:容纳静音段 + 未弹出语音,内存 ~3.8 MB
+        )
+        .map_err(|e| anyhow::anyhow!("silero-vad 加载失败: {e}"))?;
+        Ok(Self { vad, fed: 0, consumed: 0 })
+    }
+
+    /// 喂入一段样本(内部按 512 窗口逐窗喂给引擎)
+    pub fn accept(&mut self, samples: Vec<f32>) {
+        if samples.is_empty() {
+            return;
+        }
+        self.fed += samples.len() as u64;
+        for chunk in samples.chunks(VAD_WINDOW_SIZE as usize) {
+            self.vad.accept_waveform(chunk.to_vec());
+        }
+    }
+
+    /// 取下一段完整语音:返回 (起始样本索引[相对 VAD 建立], 语音样本)。
+    pub fn next_segment(&mut self) -> Option<(u64, Vec<f32>)> {
+        if self.vad.is_empty() {
+            return None;
+        }
+        let seg = self.vad.front();
+        self.vad.pop();
+        let len = seg.samples.len() as u64;
+        // sherpa-onnx 的 start 是相对整个输入流的绝对样本索引;
+        // 语义异常(早于已消费位置)时退化为顺序偏移,保证时间轴单调
+        let start = if seg.start >= 0 && (seg.start as u64) >= self.consumed {
+            seg.start as u64
+        } else {
+            self.consumed
+        };
+        self.consumed = (start + len).max(self.consumed);
+        Some((start, seg.samples))
+    }
+
+    /// 结束时冲刷:把尾部未判停的语音强制成段弹出(之后照常 next_segment)
+    pub fn flush(&mut self) {
+        self.vad.flush();
+    }
 }

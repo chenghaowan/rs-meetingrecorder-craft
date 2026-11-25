@@ -375,13 +375,20 @@ impl App {
         let shared2 = shared.clone();
         let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
         let asr = LocalAsr::from_config(&cfg2).ok().flatten().map(std::sync::Arc::new);
+        let vad = match mrc_core::stt::VadStream::from_config(&cfg2) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[stt] VAD 不可用,回退固定窗口切句: {e:#}");
+                None
+            }
+        };
         // 自动截图(指定窗口,防漏截):间隔 0=关;pointtofix 缺失时静默跳过
         let auto_shots = cfg2.shots.auto_window_secs > 0.0 && !cfg2.shots.default_window.trim().is_empty();
         let shot_every = std::time::Duration::from_secs_f64(cfg2.shots.auto_window_secs.max(1.0));
         let mut last_shot = std::time::Instant::now() - shot_every; // 首个 tick 立即截一张
         let pf_exe = tools::resolve_available(&cfg2);
         std::thread::spawn(move || {
-            let mut streaming = Streaming::new(asr, cfg2.stt.window_secs);
+            let mut streaming = Streaming::new(asr, vad, cfg2.stt.window_secs);
             let mut idx: i64 = 0;
             let res = (|| -> Result<()> {
                 let conn = db::open(&cfg2.db_path())?;
@@ -437,8 +444,8 @@ impl App {
                     }
                     std::thread::sleep(Duration::from_millis(2000));
                 }
-                // 收尾残余
-                if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.tick(&shared2) {
+                // 收尾残余(VAD 冲刷尾部语音)
+                if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.drain(&shared2) {
                     for s in &segs {
                         db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
                         subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
