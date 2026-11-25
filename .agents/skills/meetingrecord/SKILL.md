@@ -18,7 +18,7 @@ description: 查询/检索本地会议记录(meetings.db + 会议包 JSON),或�
   - `meta.json` — 元信息
 - 录音归档:`%APPDATA%\ltl-meetingrecord\audio\meeting_<id>.wav`
 
-关键表:`meetings`(status: recording/processing/done/failed)、`segments`(speaker 列是簇键 SPEAKER_xx,显示名在 `speakers` 表 JOIN)、`speakers`(name/proposed_name/similarity)、`voiceprints`(声纹库,name+centroid BLOB)。
+关键表:`meetings`(status: recording/processing/done/failed;audio_remote_path=环回远端 WAV)、`segments`(speaker 列是簇键 SPEAKER_xx,显示名在 `speakers` 表 JOIN;source='mic'|'remote' 区分采集来源)、`speakers`(name/proposed_name/similarity)、`voiceprints`(声纹库,name+centroid BLOB+embedding_model)。
 
 ## 2. CLI(recorder 二进制,双职责)
 
@@ -33,9 +33,9 @@ mrc-recorder --tool-launch                 # 启动截图工具
 mrc-recorder --shot-window 关键词 [--shot-window-ocr]
                                            # 指定窗口截图:标题关键词→DWM 精确矩形→
                                            # pointtofixcraft 落库,JSON 回执(shot_id/file/ocr)
-mrc-recorder --gateway                     # 确保网关就绪(health→本地拉起→release 下载)
+mrc-recorder --fetch-models                # 预下载本地模型(SenseVoice 230MB + diarize 34MB;开会缺模型也会自动下)
 mrc-recorder --transcribe <wav>
-                                           # 无头转写(网关 SenseVoice),JSON 段落回执
+                                           # 无头转写(本地 SenseVoice+VAD 切句),JSON 段落回执
                                            # 含 duration_s/elapsed_s;任意采样率单/双声道皆可
 ```
 
@@ -78,10 +78,11 @@ SELECT text FROM segments WHERE meeting_id=3 AND text LIKE '%偷胶%';
 
 ## 4. 注意
 
-- 转写唯一引擎 = wanai 网关 /asr(SenseVoice,zh/en/ja/ko/yue,自带标点;[stt] 配语言/窗口);网关不可用时自动降级只归档并持续重试
-- 网关(rs-aiprivaderCraft)是必要软件:`mrc-recorder --gateway` 或 GUI 设置里可见状态;health 探测→本地 exe→gh release 下载 三段式;模型(SenseVoice/opus-mt/BGE)由网关自动下载,本项目不管理
-- 字幕实时翻译(`[translate]`):`provider = "wanai"` 走本地网关 rs-aiprivaderCraft(opus-mt,127.0.0.1:17800,网关 M3 前自动降级不翻);`"llm"` 复用 [llm] 云端;`"baidu"` 百度 API。译文在 `segments.translation`/字幕条第二行/transcript.json
+- 全链路本地化,无外部网关依赖:采集(cpal 麦克风 + wasapi 环回)→ STT(SenseVoice 进程内 ONNX + silero-vad 切句)→ 说话人(pyannote-segmentation + CAM++ ONNX,全 CPU)→ 翻译(llama-server Vulkan + Hy-MT3,可选)
+- 转写唯一引擎 = 本地 SenseVoice(zh/en/ja/ko/yue,自带标点;[stt] 配语言);模型缺失开会自动下载(~230MB,hf-mirror),失败降级只归档
+- 双路采集:现场麦克风(source='mic')与系统环回(source='remote',Teams 等会议软件远端声)并行转写,segments.source 可区分;归档双 WAV(meeting_<id>.wav / meeting_<id>_remote.wav)
+- 字幕实时翻译(`[translate]`):`provider = "local"` 走本机 llama-server + Hy-MT3(GPU,离线,自动拉起 127.0.0.1:17810);`"llm"` 复用 [llm] 端点;`"baidu"` 百度 API。译文在 `segments.translation`/字幕条第二行/transcript.json
 - LLM 总结需 `[llm] api_key`;`--no-llm` 只出转写/截图/骨架包
-- 说话人分离需 pyannote(python + HF token);没有时名字全靠手动命名
+- 说话人分离全本地 ONNX(模型自动下载 34MB);含语言线索纠偏(短应答继承/回合约束/称呼反推);失败自动跳过,名字全靠手动命名;声纹跨会议预填(只比同嵌入模型质心)
 - 会议包重跑幂等(复用同目录覆盖);截图源是 pointtofixcraft 的 gallery.db(只读)
 - F8 截图归 pointtofixcraft;本工具热键是 F9

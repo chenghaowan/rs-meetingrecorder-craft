@@ -23,27 +23,29 @@ rs-meetingrecorder-craft 是本地工具链里专管"会议纪要"的那一半:�
 
 ```
 (会议进行中)                            (会议结束)
-CPAL 采集                                Meeting Post Process
+CPAL 麦克风 + WASAPI 环回                Meeting Post Process
   ↓                                        ↓
-PCM Buffer                               Chunk(5 分钟 / 1000 token)
+PCM 双路缓冲(现场/远端)                  Chunk(5 分钟 / 1000 token)
   ↓                                        ↓
-本地 SenseVoice 流式转写(进程内)        截图 ↔ 发言匹配(±30 秒)
-  ↓                                        ↓
-说话人分离(pyannote 外挂)               LLM 一次性总结,输出结构化 JSON
-  ↓                                        ↓
-meetings.db                     →  transcript.json · summary.json
-                                   actions.json · decisions.json
-(并行,独立软件)                         ↓
-F8 截图 → gallery.db                    RAG 入库
+本地 SenseVoice + silero-VAD 切句        截图 ↔ 发言匹配(±30 秒)
+(进程内,按自然语句)                        ↓
+  ↓                                      LLM 一次性总结,输出结构化 JSON
+说话人分离(本地 ONNX)                      ↓
+  ↓                                     transcript.json · summary.json
+meetings.db                     →       actions.json · decisions.json
+(并行,独立软件)                            ↓
+F8 截图 → gallery.db                     RAG 入库
 ```
 
 ## 功能
 
-- **唯一 STT 引擎,全本地**:进程内 SenseVoice-small(sherpa-onnx ONNX 跑 CPU —— 无网关无服务端,比 whisper 快数倍,自带标点,zh/en/ja/ko/yue)。模型首次自动下载(~230 MB,经 hf-mirror),由本软件自行管理。
+- **四层全本地,零网关**:采集(cpal 麦克风 + WASAPI 环回)→ 转写(SenseVoice 进程内 ONNX)→ 说话人(pyannote-segmentation + CAM++ ONNX,全 CPU)→ 翻译(llama.cpp Vulkan + Hy-MT3,可选)。全部跑在本机。
+- **双路采集**:麦克风录现场(`source='mic'`),WASAPI 环回抓系统输出——Teams 等会议软件的远端声音(`source='remote'`),两路并行转写、双 WAV 归档。
+- **唯一 STT 引擎,全本地**:进程内 SenseVoice-small(sherpa-onnx ONNX 跑 CPU,数倍于实时,自带标点,zh/en/ja/ko/yue),内嵌 silero-VAD(630KB 随二进制分发)按自然语句切句。模型首次自动下载(~230 MB,经 hf-mirror),由本软件自行管理。
 - **悬浮小面板**(132×96,与 PointToFix Craft 待机条同尺寸):状态灯、计时、开始/结束,置顶可配,可拖拽。
 - **屏幕底部字幕条**(第二个原生视口):最近两条转写 + 录音计时;置顶/字号/透明度/底部边距可配。
-- **流式转写**:12 秒滑动窗口 + 尾巴续传,段落不重复;失败窗口自动重试,音频不丢。
-- **务实的说话人命名**:分离只产出匿名簇(SPEAKER_00…);名字靠 10 秒人工确认(样例发言 + 历史名单一键点选),**声纹匹配**跨会议自动预填(192/512 维向量存 SQLite BLOB,余弦暴力扫,百人库微秒级)。
+- **流式转写**:silero-VAD 按语音活动切句(延迟低,不用等固定窗口);无 VAD 时回退固定窗口模式。失败窗口自动重试,音频不丢。
+- **务实的说话人命名**:分离(pyannote-segmentation + CAM++ 声纹,本地 ONNX,模型自动下载约 34 MB)只产出匿名簇(SPEAKER_00…),并用语言线索纠偏(短应答继承/回合约束/称呼反推);名字靠 10 秒人工确认(样例发言 + 历史名单一键点选),**声纹匹配**跨会议自动预填(向量存 SQLite BLOB,余弦暴力扫;跨模型质心永不比对)。
 - **LLM 一次成稿**:长上下文模型整场一次性总结,强制输出结构化 JSON(summary / decisions / actions / risks,每条带 evidence_time 溯源);超长自动降级为两段总结 + 一次合并。
 - **会议包** —— 纯文件,零锁定:
   ```
@@ -55,7 +57,7 @@ F8 截图 → gallery.db                    RAG 入库
   ├── screenshots/         # img001.png…(复制快照)
   └── meta.json
   ```
-- **设置界面**:转写语言/窗口、pyannote token、LLM 端点(任何 OpenAI 兼容 API)、字幕选项、chunk 参数、RAG 地址 —— 内置 **PointToFix Craft 安装器**(.exe 直链 / 本地路径 / 自动探测兄弟仓库便携包)。
+- **设置界面**:转写语言、说话人分离开关、LLM 端点(任何 OpenAI 兼容 API)、字幕选项、chunk 参数、RAG 地址 —— 内置 **PointToFix Craft 安装器**(.exe 直链 / 本地路径 / 自动探测兄弟仓库便携包)。
 - **国际化**:中文 / English / Deutsch / 日本語,首次启动跟随系统,设置里可切换。
 - **无头 CLI** 供脚本与 AI 代理使用(`--start`、`--status`、`--tool-install`、`--tool-launch`、`--fetch-models`),另有 `mrc-postprocess` CLI 重跑后处理。
 
@@ -64,7 +66,7 @@ F8 截图 → gallery.db                    RAG 入库
 - Windows 10/11 x64
 - 构建:Rust 2021(无需 CMake/libclang —— whisper.cpp 已移除)
 - 转写:`mrc-recorder --fetch-models` 下载一次本地 SenseVoice 模型(hf-mirror;开会缺模型时也会自动下载)
-- 可选:python + `pyannote.audio`(说话人分离);任意 OpenAI 兼容 API key(LLM 总结)
+- 可选:llama.cpp Vulkan 预编译包 + Hy-MT3 GGUF(放 `%APPDATA%\ltl-meetingrecord\` 下即可离线 GPU 翻译);任意 OpenAI 兼容 API key(LLM 总结)
 
 ## 从源码构建
 
@@ -107,10 +109,7 @@ mrc-postprocess rag 3              # 重试 RAG 入库
 AI 代理技能(`.agents/skills/meetingrecord`)文档化了数据库/会议包契约,供自动化检索使用。
 
 ## 字幕翻译与窗口截图
-- **本地模型翻译**(`provider = "wanai"`):路由到 WanAI Runtime 网关(rs-aiprivaderCraft,`http://127.0.0.1:17800`)的 `/translate`,跑本地 opus-mt ONNX 模型,完全离线。网关 M3 翻译端点就位前,该 provider 自动降级为不翻译。`provider = "llm"` 为云端备选。
-
-
-- **字幕实时翻译**(`[translate]`):`provider = "llm"` 复用 `[llm]` 的 OpenAI 兼容端点(统一模型网关 rs-aiprivaderCraft 就位后指向它即可,零改动切换);`"baidu"` 走百度翻译开放 API(与 ltl-manage 同一套 appid/secret);`"none"` 关闭。llm 模式按 3~5 段攒批翻译,术语按行业惯例保留;译文写进 `segments.translation`、字幕条第二行、`transcript.json`。
+- **字幕实时翻译**(`[translate]`):`provider = "local"` 走本机 llama.cpp Vulkan 服务 + Hy-MT3 GGUF(离线、GPU、自动拉起 127.0.0.1:17810,官方 Hy-MT 提示词模板逐段直翻);`"llm"` 复用 `[llm]` 的 OpenAI 兼容端点(按 3~5 段攒批,术语按行业惯例保留);`"baidu"` 走百度翻译开放 API;`"none"` 关闭。译文写进 `segments.translation`、字幕条第二行、`transcript.json`。
 - **指定窗口截图**:窗口标题关键词 → DWM 精确可见矩形 → 复用 pointtofixcraft 无头 `--capture` 落库。三处入口:CLI `mrc-recorder --shot-window 飞书 [--shot-window-ocr]`;面板录音中 📷 按钮;`auto_window_secs` 定时自动截图(防漏截)。被遮挡/最小化的窗口截到的是屏幕该区域当前内容(区域截图本质限制);窗口内容级截取在二期。
 
 ## 与兄弟工具的契约

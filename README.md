@@ -23,28 +23,30 @@ rs-meetingrecorder-craft is the "meeting notes" half of a local toolchain: it de
 
 ```
 (during the meeting)                    (after the meeting)
-CPAL capture                            Post-process
+CPAL mic + WASAPI loopback              Post-process
   ↓                                       ↓
-PCM buffer                              Chunk (5 min / 1000 tokens)
+PCM buffers (mic / remote)              Chunk (5 min / 1000 tokens)
   ↓                                       ↓
-Local SenseVoice streaming (in-process)  Screenshot ↔ speech matching (±30 s)
-  ↓                                       ↓
-Speaker diarization (pyannote add-on)   LLM summary — one call, structured JSON
-  ↓                                       ↓
-meetings.db                    →  transcript.json · summary.json
-                                  actions.json · decisions.json
-(parallel, separate tool)              ↓
+Local SenseVoice + silero-VAD           Screenshot ↔ speech matching (±30 s)
+(in-process, sentence-level)              ↓
+  ↓                                     LLM summary — one call, structured JSON
+Speaker diarization (local ONNX)          ↓
+  ↓                                     transcript.json · summary.json
+meetings.db                    →        actions.json · decisions.json
+(parallel, separate tool)                 ↓
 F8 screenshot → gallery.db            Ingest into RAG
 ```
 
 ## Features
 
-- **One STT engine, fully local**: in-process SenseVoice-small via sherpa-onnx (CPU ONNX, no gateway, no server — several times faster than whisper was, punctuation included, zh/en/ja/ko/yue). Models are auto-downloaded once (~230 MB via hf-mirror) and managed by this app itself.
+- **Four local layers, zero gateway**: capture (mic + WASAPI loopback) → STT (SenseVoice in-process ONNX) → speakers (pyannote-segmentation + CAM++ ONNX, all CPU) → translation (llama.cpp Vulkan + Hy-MT3, optional). Everything runs on this machine.
+- **Dual-path capture**: the microphone records the room (`source='mic'`) while a WASAPI loopback tap on the output device catches what meeting apps like Teams play (`source='remote'`) — remote voices and in-room voices land as separate, parallel transcribed streams (two archived WAVs).
+- **One STT engine, fully local**: in-process SenseVoice-small via sherpa-onnx (CPU ONNX — several times faster than realtime, punctuation included, zh/en/ja/ko/yue), cut into natural sentences by embedded silero-VAD (~630 KB shipped inside the binary). Models are auto-downloaded once (~230 MB via hf-mirror) and managed by this app itself.
 
 - **Floating mini panel** (132×96, same size as PointToFix Craft's standby bar): status light, elapsed time, start/stop, always-on-top, draggable.
 - **Live subtitle bar** at the bottom of the screen (a second native viewport): last two transcript lines + a recording timer; on-top, font size, opacity and margin are configurable.
-- **Streaming transcription**: 12 s sliding window with tail continuation — no duplicated segments; failed windows are retried without dropping audio.
-- **Speaker naming, the pragmatic way**: diarization only produces anonymous clusters (`SPEAKER_00`…); names come from a 10-second manual pass (sample utterances, known-name shortcuts), with **voiceprint matching** pre-filling names across meetings (192/512-dim embeddings stored as SQLite BLOBs, cosine brute-force — microseconds at hundreds of speakers).
+- **Streaming transcription**: silero-VAD cuts speech into natural sentences (low latency, no fixed-window wait); a fixed-window fallback covers the rare no-VAD case. Failed decodes are retried without dropping audio.
+- **Speaker naming, the pragmatic way**: diarization (pyannote segmentation + CAM++ voiceprints, local ONNX, ~34 MB auto-downloaded) only produces anonymous clusters (`SPEAKER_00`…), refined by language cues (short-ack inheritance, turn constraints, vocative exclusion); names come from a 10-second manual pass (sample utterances, known-name shortcuts), with **voiceprint matching** pre-filling names across meetings (embeddings stored as SQLite BLOBs, cosine brute-force; cross-model centroids never compared).
 - **LLM minutes in one call**: long-context model summarizes the whole transcript at once and must return structured JSON (summary / decisions / actions / risks, each with an `evidence_time`); oversized transcripts automatically fall back to two halves + a merge pass.
 - **Meeting package** — plain files, no lock-in:
   ```
@@ -56,16 +58,16 @@ F8 screenshot → gallery.db            Ingest into RAG
   ├── screenshots/         # img001.png… (copied snapshots)
   └── meta.json
   ```
-- **Settings GUI**: STT language/window, pyannote token, LLM endpoint (any OpenAI-compatible API), subtitle options, chunk parameters, RAG URL — plus a built-in **installer for PointToFix Craft** (direct .exe link, local path, or auto-detected sibling build).
+- **Settings GUI**: STT language, diarization toggle, LLM endpoint (any OpenAI-compatible API), subtitle options, chunk parameters, RAG URL — plus a built-in **installer for PointToFix Craft** (direct .exe link, local path, or auto-detected sibling build).
 - **i18n**: 中文 / English / Deutsch / 日本語, following the system UI language on first start; switchable in Settings.
 - **Headless CLI** for scripts and AI agents (`--start`, `--status`, `--tool-install`, `--tool-launch`, `--fetch-models`), plus a `mrc-postprocess` CLI for re-running the pipeline.
 
 ## Requirements
 
 - Windows 10/11 x64
-- To build: Rust 2021 (no CMake/libclang needed — whisper.cpp is gone)
-- To transcribe: run `mrc-recorder --fetch-models` once (SenseVoice downloads automatically via hf-mirror; meetings also auto-download when the model is missing)
-- Optional: python + `pyannote.audio` for speaker diarization; any OpenAI-compatible API key for the LLM summary
+- To build: Rust 2021 for the app itself (sherpa-rs binds prebuilt binaries; libclang via `pip install libclang` is needed by bindgen — see `.cargo/config.toml` comments)
+- To transcribe/diarize: run `mrc-recorder --fetch-models` once (SenseVoice + diarization models download automatically via hf-mirror; meetings also auto-download when missing)
+- Optional: `llama-b*-bin-win-vulkan-x64.zip` (llama.cpp release) + a Hy-MT3 GGUF under `%APPDATA%\ltl-meetingrecord\` for offline GPU translation; any OpenAI-compatible API key for the LLM summary
 
 ## Build from source
 
@@ -108,7 +110,7 @@ mrc-postprocess rag 3              # retry RAG ingestion
 An AI-agent skill (`.agents/skills/meetingrecord`) documents the database/package contracts for automated retrieval.
 
 ## Live translation & window capture
-- **Live subtitle translation** (`[translate]`): `provider = "llm"` reuses the `[llm]` OpenAI-compatible endpoint (works with any cloud or local server); `"baidu"` uses the Baidu Translate Open API (same appid/secret as ltl-manage); `"none"` disables. LLM mode batches 3-5 lines per call and keeps engineering terms; translations land in `segments.translation`, the second subtitle line, and `transcript.json`.
+- **Live subtitle translation** (`[translate]`): `provider = "local"` runs a local llama.cpp Vulkan server with a Hy-MT3 GGUF (offline, GPU, auto-started on 127.0.0.1:17810, official Hy-MT prompt template); `"llm"` reuses the `[llm]` OpenAI-compatible endpoint; `"baidu"` uses the Baidu Translate Open API; `"none"` disables. Translations land in `segments.translation`, the second subtitle line, and `transcript.json`.
 - **Window capture**: a window-title keyword is resolved to the exact visible rect (DWM frame bounds) and shot through pointtofixcraft's headless `--capture`. Three entry points: CLI `mrc-recorder --shot-window Teams [--shot-window-ocr]`; the 📷 button on the panel while recording; `auto_window_secs` periodic auto-shots. Occluded/minimized windows capture whatever is on screen in that region (inherent to region capture); per-window content capture is planned.
 
 ## Contracts with sibling tools

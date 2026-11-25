@@ -9,14 +9,19 @@ provider = "sensevoice"  # "sensevoice" | "none"(只录音归档)
 model_dir = ""           # 模型目录(需 model.int8.onnx + tokens.txt);留空自动找 data_dir\models\sensevoice
 language = "auto"        # auto / zh / en / ja / ko / yue
 num_threads = 2          # ONNX 推理线程数
-window_secs = 12.0       # 流式解码窗口
+window_secs = 12.0       # 流式解码窗口(无 VAD 回退模式用;有 silero-vad 时忽略)
+
+# ── 采集(现场麦克风 + 环回远端声)──
+[capture]
+mic_enabled = true       # 采集现场麦克风
+loopback_enabled = true  # 环回采集系统输出声(Teams 等会议软件的远端声音)
+loopback_device = ""     # 输出设备友好名子串;留空 = 默认输出设备
 
 [diarize]
-python = ""              # python 解释器;留空用 PATH 上的 python
-script = ""              # diarize.py 路径;留空自动找 scripts\diarize.py
-hf_token = ""            # HuggingFace token(pyannote 模型)
-enabled = true
-timeout_secs = 600
+# 说话人分离全本地 ONNX(pyannote-segmentation + CAM++ 声纹,模型自动下载约 34 MB)
+enabled = true           # 失败自动跳过(名字全靠手动命名)
+threshold = 0.5          # 聚类阈值(簇数未知走阈值模式;越小簇越少)
+cross_match = 0.4        # 跨流(mic/remote)簇质心合并的余弦阈值
 
 [llm]
 # OpenAI 兼容端点(dashscope / deepseek / ollama / vllm 均可)
@@ -68,7 +73,8 @@ pointtofix_url = ""
 pointtofix_exe = ""
 
 [translate]
-# 字幕实时翻译: "llm"(复用 [llm] 端点,编号批量,术语更准) | "baidu" | "none"
+# 字幕实时翻译: "local"(llama-server + Hy-MT3,本机 GPU,离线,自动拉起 127.0.0.1:17810)
+#             | "llm"(复用 [llm] 端点,编号批量,术语更准) | "baidu" | "none"
 provider = "none"
 from_lang = "zh"
 to_lang = "en"
@@ -77,3 +83,13 @@ batch_size = 4              # llm provider 每次调用翻译的段数
 appid = ""
 secret = ""
 api_url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+
+[translate.local]
+# llama-server(b12716 Vulkan 预编译包)+ Hy-MT3 GGUF;留空自动发现:
+#   exe: data_dir\tools\llama-vulkan\llama-server.exe
+#   模型: data_dir\models\hy-mt3\*.gguf
+server_exe = ""
+model_path = ""
+port = 17810
+ngl = 99                    # GPU 卸载层数(99=全部进显存)
+ctx = 4096
