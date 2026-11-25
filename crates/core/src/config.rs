@@ -155,6 +155,23 @@ impl Default for PostCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct CaptureCfg {
+    /// 采集现场麦克风
+    pub mic_enabled: bool,
+    /// 环回采集系统输出声(Teams 等会议软件的远端声音)
+    pub loopback_enabled: bool,
+    /// 输出设备友好名子串;留空 = 默认渲染设备
+    pub loopback_device: String,
+}
+
+impl Default for CaptureCfg {
+    fn default() -> Self {
+        Self { mic_enabled: true, loopback_enabled: true, loopback_device: String::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// meetings.db 与会议包根目录所在数据目录
     pub data_dir: Option<PathBuf>,
@@ -166,6 +183,8 @@ pub struct Config {
     /// STT(SenseVoice 本地 sherpa-rs;alias 兼容旧 [whisper] 段)
     #[serde(alias = "whisper")]
     pub stt: SttCfg,
+    /// 采集(麦克风 + 环回)
+    pub capture: CaptureCfg,
     pub diarize: DiarizeCfg,
     pub llm: LlmCfg,
     pub shots: ShotsCfg,
@@ -258,6 +277,7 @@ impl Default for Config {
             audio_dir: None,
             packages_dir: None,
             stt: SttCfg::default(),
+            capture: CaptureCfg::default(),
             diarize: DiarizeCfg {
                 python: None,
                 script: None,

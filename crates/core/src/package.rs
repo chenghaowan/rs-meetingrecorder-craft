@@ -53,6 +53,7 @@ pub fn write_all(inp: &PackageInput, dir: &Path, shot_files: &[(PathBuf, PathBuf
             "start_ms": s.start_ms,
             "end_ms": s.end_ms,
             "speaker": s.speaker,
+            "source": s.source,
             "text": s.text,
             "translation": s.translation,
         })).collect::<Vec<_>>(),

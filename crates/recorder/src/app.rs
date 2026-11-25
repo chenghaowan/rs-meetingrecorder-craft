@@ -54,7 +54,9 @@ pub enum Mode {
 struct Session {
     meeting_id: i64,
     _capture: capture::Capture,
+    loopback: Option<mrc_core::capture_loopback::LoopbackCapture>,
     shared: CaptureShared,
+    remote_shared: Option<CaptureShared>,
     stop_tx: mpsc::Sender<()>,
     done_rx: mpsc::Receiver<Result<()>>,
 }
@@ -358,8 +360,23 @@ impl App {
         let title = format!("{} {}", self.lang.strings().app_title, db::fmt_local(now));
         let meeting_id = db::insert_meeting(&self.conn, &title, now)?;
         let audio_path = self.cfg.audio_dir().join(format!("meeting_{meeting_id}.wav"));
-        let (cap, shared) = capture::open(&audio_path, |e| eprintln!("[capture] {e}"))
+        let (cap, shared) = capture::open_mic(&audio_path, |e| eprintln!("[capture] {e}"))
             .context(self.lang.strings().err_capture)?;
+        // 环回远端声(失败只录现场,不打扰开会)
+        let (loopback, remote_shared) = if self.cfg.capture.loopback_enabled {
+            let remote_path = self.cfg.audio_dir().join(format!("meeting_{meeting_id}_remote.wav"));
+            match mrc_core::capture_loopback::open(&remote_path, &self.cfg.capture.loopback_device, |e| {
+                eprintln!("[loopback] {e}")
+            }) {
+                Ok((lb, sh)) => (Some(lb), Some(sh)),
+                Err(e) => {
+                    eprintln!("[loopback] {e:#}(只录现场)");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
 
         {
             let mut g = self.live.lock().expect("live 锁");
@@ -373,6 +390,7 @@ impl App {
         let cfg2 = self.cfg.clone();
         let live2 = std::sync::Arc::clone(&self.live);
         let shared2 = shared.clone();
+        let remote_shared2 = remote_shared.clone();
         let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
         let asr = LocalAsr::from_config(&cfg2).ok().flatten().map(std::sync::Arc::new);
         let vad = match mrc_core::stt::VadStream::from_config(&cfg2) {
@@ -382,13 +400,16 @@ impl App {
                 None
             }
         };
+        let vad_remote = mrc_core::stt::VadStream::from_config(&cfg2).unwrap_or(None);
         // 自动截图(指定窗口,防漏截):间隔 0=关;pointtofix 缺失时静默跳过
         let auto_shots = cfg2.shots.auto_window_secs > 0.0 && !cfg2.shots.default_window.trim().is_empty();
         let shot_every = std::time::Duration::from_secs_f64(cfg2.shots.auto_window_secs.max(1.0));
         let mut last_shot = std::time::Instant::now() - shot_every; // 首个 tick 立即截一张
         let pf_exe = tools::resolve_available(&cfg2);
         std::thread::spawn(move || {
-            let mut streaming = Streaming::new(asr, vad, cfg2.stt.window_secs);
+            let mut streaming = Streaming::new(asr.clone(), vad, cfg2.stt.window_secs);
+            let mut remote = remote_shared2
+                .map(|sh| (sh, Streaming::new(asr.clone(), vad_remote, cfg2.stt.window_secs)));
             let mut idx: i64 = 0;
             let res = (|| -> Result<()> {
                 let conn = db::open(&cfg2.db_path())?;
@@ -403,7 +424,7 @@ impl App {
                             let mut new_idx: Vec<i64> = Vec::new();
                             let mut new_start: Vec<i64> = Vec::new();
                             for s in &segs {
-                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
+                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("mic"), &s.text)?;
                                 new_idx.push(idx);
                                 new_texts.push(s.text.clone());
                                 new_start.push(s.start_ms);
@@ -432,6 +453,16 @@ impl App {
                         }
                         mrc_core::transcribe::StreamEvent::Idle => {}
                     }
+                    // 远端流(环回;失败静默,原文照常)
+                    if let Some((rsh, rst)) = remote.as_mut() {
+                        if let mrc_core::transcribe::StreamEvent::Segments(segs) = rst.tick(rsh) {
+                            for s in &segs {
+                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("remote"), &s.text)?;
+                                idx += 1;
+                                subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
+                            }
+                        }
+                    }
                     // 自动窗口截图(失败静默,只打印一次)
                     if auto_shots && last_shot.elapsed() >= shot_every {
                         last_shot = std::time::Instant::now();
@@ -444,11 +475,21 @@ impl App {
                     }
                     std::thread::sleep(Duration::from_millis(2000));
                 }
-                // 收尾残余(VAD 冲刷尾部语音)
+                // 收尾残余(双路 VAD 冲刷尾部语音)
                 if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.drain(&shared2) {
                     for s in &segs {
-                        db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
+                        db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("mic"), &s.text)?;
                         subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
+                        idx += 1;
+                    }
+                }
+                if let Some((rsh, rst)) = remote.as_mut() {
+                    if let mrc_core::transcribe::StreamEvent::Segments(segs) = rst.drain(rsh) {
+                        for s in &segs {
+                            db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("remote"), &s.text)?;
+                            subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
+                            idx += 1;
+                        }
                     }
                 }
                 Ok(())
@@ -459,7 +500,9 @@ impl App {
         self.session = Some(Session {
             meeting_id,
             _capture: cap,
+            loopback,
             shared,
+            remote_shared,
             stop_tx,
             done_rx,
         });
@@ -483,13 +526,25 @@ impl App {
             if let Ok(Err(e)) = s.done_rx.recv_timeout(Duration::from_secs(30)) {
                 eprintln!("[warn] 转写线程异常: {e:#}");
             }
+            if let Some(lb) = s.loopback {
+                lb.stop();
+            }
             if let Err(e) = s.shared.finalize() {
                 eprintln!("[warn] WAV 收尾失败: {e:#}");
             }
+            if let Some(sh) = &s.remote_shared {
+                if let Err(e) = sh.finalize() {
+                    eprintln!("[warn] 远端 WAV 收尾失败: {e:#}");
+                }
+            }
             let ended = db::now_ms();
+            let remote_rel = s
+                .remote_shared
+                .as_ref()
+                .map(|_| format!("audio\\meeting_{}_remote.wav", s.meeting_id));
             let outcome = (|| -> std::result::Result<(String, Option<String>), WorkerFail> {
                 let mut conn = db::open(&cfg.db_path()).map_err(|e| WorkerFail::Fatal(e.to_string()))?;
-                db::finish_meeting(&conn, s.meeting_id, ended, &format!("audio\\meeting_{}.wav", s.meeting_id))
+                db::finish_meeting(&conn, s.meeting_id, ended, &format!("audio\\meeting_{}.wav", s.meeting_id), remote_rel.as_deref())
                     .map_err(|e| WorkerFail::Fatal(e.to_string()))?;
                 match pipeline::run(&cfg, &mut conn, s.meeting_id, false, false, false) {
                     Ok(r) => Ok((format!("{r}"), r.package_dir.clone())),

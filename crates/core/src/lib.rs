@@ -6,6 +6,7 @@
 //! 都是薄壳,业务全在这里。
 
 pub mod capture;
+pub mod capture_loopback;
 pub mod chunk;
 pub mod config;
 pub mod db;

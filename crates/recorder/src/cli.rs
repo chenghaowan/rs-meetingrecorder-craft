@@ -28,7 +28,6 @@ use mrc_core::windowcap;
 use std::sync::Arc;
 
 use crate::i18n::Lang;
-
 pub enum CliAction {
     /// 正常启动 GUI
     Gui,
@@ -279,14 +278,30 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
     let conn = db::open(&cfg.db_path())?;
     let meeting_id = db::insert_meeting(&conn, &title, now)?;
     let audio_path = cfg.audio_dir().join(format!("meeting_{meeting_id}.wav"));
-    let (_cap, shared) = capture::open(&audio_path, |e| eprintln!("[capture] {e}"))
+    let (_cap, shared) = capture::open_mic(&audio_path, |e| eprintln!("[capture] {e}"))
         .context("打开录音设备失败")?;
+    // 环回远端声(Teams 等系统输出;失败只录现场)
+    let (loopback, remote_shared) = if cfg.capture.loopback_enabled {
+        let remote_path = cfg.audio_dir().join(format!("meeting_{meeting_id}_remote.wav"));
+        match mrc_core::capture_loopback::open(&remote_path, &cfg.capture.loopback_device, |e| {
+            eprintln!("[loopback] {e}")
+        }) {
+            Ok((lb, sh)) => (Some(lb), Some(sh)),
+            Err(e) => {
+                eprintln!("[loopback] {e:#}(只录现场)");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
 
-    // 转写线程(同 GUI 版逻辑)
+    // 转写线程(同 GUI 版逻辑):现场 + 远端两路,各自 VAD,共享识别器
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<Result<()>>();
     let cfg2 = cfg.clone();
     let shared2 = shared.clone();
+    let remote_shared2 = remote_shared.clone();
     let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
     let asr = LocalAsr::from_config(&cfg2).ok().flatten().map(Arc::new);
     let vad = match mrc_core::stt::VadStream::from_config(&cfg2) {
@@ -296,8 +311,11 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
             None
         }
     };
+    let vad_remote = mrc_core::stt::VadStream::from_config(&cfg2).unwrap_or(None);
     std::thread::spawn(move || {
-        let mut streaming = Streaming::new(asr, vad, cfg2.stt.window_secs);
+        let mut streaming = Streaming::new(asr.clone(), vad, cfg2.stt.window_secs);
+        let mut remote = remote_shared2
+            .map(|sh| (sh, Streaming::new(asr.clone(), vad_remote, cfg2.stt.window_secs)));
         let mut idx: i64 = 0;
         let res = (|| -> Result<()> {
             let conn = db::open(&cfg2.db_path())?;
@@ -311,7 +329,7 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
                         let mut new_texts: Vec<String> = Vec::new();
                         let mut new_idx: Vec<i64> = Vec::new();
                         for s in &segs {
-                            db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
+                            db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("mic"), &s.text)?;
                             new_idx.push(idx);
                             new_texts.push(s.text.clone());
                             idx += 1;
@@ -330,11 +348,33 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
                     mrc_core::transcribe::StreamEvent::Error(e) => eprintln!("[warn] 转写失败(重试): {e}"),
                     mrc_core::transcribe::StreamEvent::Idle => {}
                 }
+                if let Some((rsh, rst)) = remote.as_mut() {
+                    match rst.tick(rsh) {
+                        mrc_core::transcribe::StreamEvent::Segments(segs) => {
+                            for s in &segs {
+                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("remote"), &s.text)?;
+                                idx += 1;
+                                eprintln!("[cli] +[远端] {}", s.text.chars().take(50).collect::<String>());
+                            }
+                        }
+                        mrc_core::transcribe::StreamEvent::Error(e) => eprintln!("[warn] 远端转写失败(重试): {e}"),
+                        mrc_core::transcribe::StreamEvent::Idle => {}
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(2000));
             }
             if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.drain(&shared2) {
                 for s in &segs {
-                    db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, &s.text)?;
+                    db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("mic"), &s.text)?;
+                    idx += 1;
+                }
+            }
+            if let Some((rsh, rst)) = remote.as_mut() {
+                if let mrc_core::transcribe::StreamEvent::Segments(segs) = rst.drain(rsh) {
+                    for s in &segs {
+                        db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("remote"), &s.text)?;
+                        idx += 1;
+                    }
                 }
             }
             Ok(())
@@ -373,9 +413,24 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
     if let Ok(Err(e)) = done_rx.recv_timeout(Duration::from_secs(30)) {
         eprintln!("[warn] 转写线程异常: {e:#}");
     }
+    if let Some(lb) = loopback {
+        lb.stop();
+    }
     shared.finalize()?;
+    if let Some(sh) = &remote_shared {
+        sh.finalize()?;
+    }
     let ended = db::now_ms();
-    db::finish_meeting(&conn, meeting_id, ended, &format!("audio\\meeting_{meeting_id}.wav"))?;
+    let remote_rel = remote_shared
+        .as_ref()
+        .map(|_| format!("audio\\meeting_{meeting_id}_remote.wav"));
+    db::finish_meeting(
+        &conn,
+        meeting_id,
+        ended,
+        &format!("audio\\meeting_{meeting_id}.wav"),
+        remote_rel.as_deref(),
+    )?;
 
     // 后处理(控制台交互命名)
     let outcome = pipeline::run(cfg, &mut { conn }, meeting_id, true, false, false);

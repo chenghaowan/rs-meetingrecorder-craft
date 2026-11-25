@@ -49,6 +49,29 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_translation {
         conn.execute_batch("ALTER TABLE segments ADD COLUMN translation TEXT NOT NULL DEFAULT '';")?;
     }
+    // v0.1.1:双路采集——segments.source('mic'|'remote')、meetings.audio_remote_path
+    let has_source: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('segments') WHERE name='source'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_source {
+        conn.execute_batch("ALTER TABLE segments ADD COLUMN source TEXT;")?;
+    }
+    let has_remote_path: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name='audio_remote_path'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_remote_path {
+        conn.execute_batch("ALTER TABLE meetings ADD COLUMN audio_remote_path TEXT;")?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meetings (
            id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,6 +143,7 @@ pub struct Meeting {
     pub ended_at: Option<i64>,
     pub status: String,
     pub audio_path: Option<String>,
+    pub audio_remote_path: Option<String>,
     pub package_dir: Option<String>,
 }
 
@@ -137,10 +161,16 @@ pub fn insert_meeting(conn: &Connection, title: &str, started_at: i64) -> Result
     Ok(conn.last_insert_rowid())
 }
 
-pub fn finish_meeting(conn: &Connection, id: i64, ended_at: i64, audio_path: &str) -> Result<()> {
+pub fn finish_meeting(
+    conn: &Connection,
+    id: i64,
+    ended_at: i64,
+    audio_path: &str,
+    audio_remote_path: Option<&str>,
+) -> Result<()> {
     conn.execute(
-        "UPDATE meetings SET ended_at=?2, audio_path=?3, status='processing' WHERE id=?1",
-        rusqlite::params![id, ended_at, audio_path],
+        "UPDATE meetings SET ended_at=?2, audio_path=?3, audio_remote_path=?4, status='processing' WHERE id=?1",
+        rusqlite::params![id, ended_at, audio_path, audio_remote_path],
     )?;
     Ok(())
 }
@@ -163,7 +193,7 @@ pub fn set_package_dir(conn: &Connection, id: i64, dir: &str) -> Result<()> {
 
 pub fn get_meeting(conn: &Connection, id: i64) -> Result<Meeting> {
     conn.query_row(
-        "SELECT id, title, started_at, ended_at, status, audio_path, package_dir
+        "SELECT id, title, started_at, ended_at, status, audio_path, audio_remote_path, package_dir
          FROM meetings WHERE id=?1",
         [id],
         |r| {
@@ -174,7 +204,8 @@ pub fn get_meeting(conn: &Connection, id: i64) -> Result<Meeting> {
                 ended_at: r.get(3)?,
                 status: r.get(4)?,
                 audio_path: r.get(5)?,
-                package_dir: r.get(6)?,
+                audio_remote_path: r.get(6)?,
+                package_dir: r.get(7)?,
             })
         },
     )
@@ -184,7 +215,7 @@ pub fn get_meeting(conn: &Connection, id: i64) -> Result<Meeting> {
 /// latest = 状态非 recording 的最新会议(后处理的对象)
 pub fn latest_meeting(conn: &Connection) -> Result<Option<Meeting>> {
     let mut st = conn.prepare(
-        "SELECT id, title, started_at, ended_at, status, audio_path, package_dir
+        "SELECT id, title, started_at, ended_at, status, audio_path, audio_remote_path, package_dir
          FROM meetings WHERE status != 'recording' ORDER BY started_at DESC LIMIT 1",
     )?;
     let mut rows = st.query([])?;
@@ -195,13 +226,14 @@ pub fn latest_meeting(conn: &Connection) -> Result<Option<Meeting>> {
         ended_at: r.get(3).unwrap(),
         status: r.get(4).unwrap(),
         audio_path: r.get(5).unwrap(),
-        package_dir: r.get(6).unwrap(),
+        audio_remote_path: r.get(6).unwrap(),
+        package_dir: r.get(7).unwrap(),
     }))
 }
 
 pub fn list_meetings(conn: &Connection) -> Result<Vec<Meeting>> {
     let mut st = conn.prepare(
-        "SELECT id, title, started_at, ended_at, status, audio_path, package_dir
+        "SELECT id, title, started_at, ended_at, status, audio_path, audio_remote_path, package_dir
          FROM meetings ORDER BY started_at DESC",
     )?;
     let rows = st.query_map([], |r| {
@@ -212,7 +244,8 @@ pub fn list_meetings(conn: &Connection) -> Result<Vec<Meeting>> {
             ended_at: r.get(3)?,
             status: r.get(4)?,
             audio_path: r.get(5)?,
-            package_dir: r.get(6)?,
+            audio_remote_path: r.get(6)?,
+            package_dir: r.get(7)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -225,12 +258,13 @@ pub fn insert_segment(
     start_ms: i64,
     end_ms: i64,
     speaker: Option<&str>,
+    source: Option<&str>,
     text: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO segments(meeting_id, idx, start_ms, end_ms, speaker, text)
-         VALUES (?1,?2,?3,?4,?5,?6)",
-        rusqlite::params![meeting_id, idx, start_ms, end_ms, speaker, text],
+        "INSERT INTO segments(meeting_id, idx, start_ms, end_ms, speaker, source, text)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        rusqlite::params![meeting_id, idx, start_ms, end_ms, speaker, source, text],
     )?;
     Ok(())
 }
@@ -241,13 +275,15 @@ pub struct Segment {
     pub start_ms: i64,
     pub end_ms: i64,
     pub speaker: Option<String>,
+    /// 采集来源:'mic'(现场)|'remote'(环回远端);旧数据/未知为 None
+    pub source: Option<String>,
     pub text: String,
     pub translation: String,
 }
 
 pub fn load_segments(conn: &Connection, meeting_id: i64) -> Result<Vec<Segment>> {
     let mut st = conn.prepare(
-        "SELECT idx, start_ms, end_ms, speaker, text, translation
+        "SELECT idx, start_ms, end_ms, speaker, source, text, translation
          FROM segments WHERE meeting_id=?1 ORDER BY start_ms",
     )?;
     let rows = st.query_map([meeting_id], |r| {
@@ -256,8 +292,9 @@ pub fn load_segments(conn: &Connection, meeting_id: i64) -> Result<Vec<Segment>>
             start_ms: r.get(1)?,
             end_ms: r.get(2)?,
             speaker: r.get(3)?,
-            text: r.get(4)?,
-            translation: r.get(5)?,
+            source: r.get(4)?,
+            text: r.get(5)?,
+            translation: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -268,7 +305,7 @@ pub fn load_segments(conn: &Connection, meeting_id: i64) -> Result<Vec<Segment>>
 pub fn load_segments_named(conn: &Connection, meeting_id: i64) -> Result<Vec<Segment>> {
     let mut st = conn.prepare(
         "SELECT s.idx, s.start_ms, s.end_ms,
-                COALESCE(sp.name, s.speaker) AS speaker, s.text, s.translation
+                COALESCE(sp.name, s.speaker) AS speaker, s.source, s.text, s.translation
          FROM segments s
          LEFT JOIN speakers sp
            ON sp.meeting_id = s.meeting_id AND sp.speaker_key = s.speaker
@@ -280,8 +317,9 @@ pub fn load_segments_named(conn: &Connection, meeting_id: i64) -> Result<Vec<Seg
             start_ms: r.get(1)?,
             end_ms: r.get(2)?,
             speaker: r.get(3)?,
-            text: r.get(4)?,
-            translation: r.get(5)?,
+            source: r.get(4)?,
+            text: r.get(5)?,
+            translation: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

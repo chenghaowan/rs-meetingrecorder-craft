@@ -55,18 +55,12 @@ pub struct Capture {
     pub audio_path: PathBuf,
 }
 
-pub fn open(
+/// 建立一路的共享缓冲:16k mono STT 缓冲 + 原始采样率 WAV 归档 writer。
+/// 麦克风(cpal 回调)与环回(wasapi 线程)共用。
+pub(crate) fn open_shared(
     audio_path: &Path,
-    on_error: impl Fn(String) + Send + 'static,
-) -> Result<(Capture, CaptureShared)> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("没有默认录音设备"))?;
-    let cfg = device.default_input_config().context("读默认输入配置失败")?;
-    let native_rate = cfg.sample_rate().0;
-    let channels = cfg.channels() as usize;
-
+    native_rate: u32,
+) -> Result<CaptureShared> {
     if let Some(dir) = audio_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -85,8 +79,24 @@ pub fn open(
         writer: Some(writer),
         resample_pos: 0.0,
     }));
+    Ok(CaptureShared(shared))
+}
 
-    let cb_shared = Arc::clone(&shared);
+pub fn open_mic(
+    audio_path: &Path,
+    on_error: impl Fn(String) + Send + 'static,
+) -> Result<(Capture, CaptureShared)> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow!("没有默认录音设备"))?;
+    let cfg = device.default_input_config().context("读默认输入配置失败")?;
+    let native_rate = cfg.sample_rate().0;
+    let channels = cfg.channels() as usize;
+
+    let shared = open_shared(audio_path, native_rate)?;
+
+    let cb_shared = shared.clone();
     let err_fn = move |e| on_error(format!("音频流错误: {e}"));
     let stream = match cfg.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
@@ -119,17 +129,11 @@ pub fn open(
     .context("建立输入流失败")?;
 
     stream.play().context("启动录音流失败")?;
-    Ok((
-        Capture {
-            stream,
-            audio_path: audio_path.to_path_buf(),
-        },
-        CaptureShared(shared),
-    ))
+    Ok((Capture { stream, audio_path: audio_path.to_path_buf() }, shared))
 }
 
-/// 回调:混单声道 → 重采样缓冲 + WAV 归档
-fn feed(shared: &Arc<Mutex<Shared>>, data: &[f32], rate: u32, channels: usize) {
+/// 回调:混单声道 → 重采样缓冲 + WAV 归档(麦克风与环回共用)
+pub(crate) fn feed(shared: &CaptureShared, data: &[f32], rate: u32, channels: usize) {
     let mono: Vec<f32> = if channels <= 1 {
         data.to_vec()
     } else {
@@ -137,7 +141,7 @@ fn feed(shared: &Arc<Mutex<Shared>>, data: &[f32], rate: u32, channels: usize) {
             .map(|ch| ch.iter().sum::<f32>() / channels as f32)
             .collect()
     };
-    if let Ok(mut g) = shared.lock() {
+    if let Ok(mut g) = shared.0.lock() {
         g.push_resampled(&mono, rate);
         if let Some(w) = g.writer.as_mut() {
             for s in &mono {
