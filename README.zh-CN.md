@@ -27,7 +27,7 @@ CPAL 采集                                Meeting Post Process
   ↓                                        ↓
 PCM Buffer                               Chunk(5 分钟 / 1000 token)
   ↓                                        ↓
-网关 /asr 流式转写(SenseVoice)         截图 ↔ 发言匹配(±30 秒)
+本地 SenseVoice 流式转写(进程内)        截图 ↔ 发言匹配(±30 秒)
   ↓                                        ↓
 说话人分离(pyannote 外挂)               LLM 一次性总结,输出结构化 JSON
   ↓                                        ↓
@@ -39,10 +39,10 @@ F8 截图 → gallery.db                    RAG 入库
 
 ## 功能
 
-- **唯一 STT 引擎,零模型管理**:语音转文字全部走 WanAI Runtime 网关(`/asr`,SenseVoice-small —— 比 whisper 快数倍,自带标点,zh/en/ja/ko/yue)。网关没装会自动安装(见下);本仓库不存放任何 STT 模型文件。
+- **唯一 STT 引擎,全本地**:进程内 SenseVoice-small(sherpa-onnx ONNX 跑 CPU —— 无网关无服务端,比 whisper 快数倍,自带标点,zh/en/ja/ko/yue)。模型首次自动下载(~230 MB,经 hf-mirror),由本软件自行管理。
 - **悬浮小面板**(132×96,与 PointToFix Craft 待机条同尺寸):状态灯、计时、开始/结束,置顶可配,可拖拽。
 - **屏幕底部字幕条**(第二个原生视口):最近两条转写 + 录音计时;置顶/字号/透明度/底部边距可配。
-- **流式转写**(走网关):12 秒滑动窗口 + 尾巴续传,段落不重复;失败窗口自动重试,音频不丢。
+- **流式转写**:12 秒滑动窗口 + 尾巴续传,段落不重复;失败窗口自动重试,音频不丢。
 - **务实的说话人命名**:分离只产出匿名簇(SPEAKER_00…);名字靠 10 秒人工确认(样例发言 + 历史名单一键点选),**声纹匹配**跨会议自动预填(192/512 维向量存 SQLite BLOB,余弦暴力扫,百人库微秒级)。
 - **LLM 一次成稿**:长上下文模型整场一次性总结,强制输出结构化 JSON(summary / decisions / actions / risks,每条带 evidence_time 溯源);超长自动降级为两段总结 + 一次合并。
 - **会议包** —— 纯文件,零锁定:
@@ -57,13 +57,13 @@ F8 截图 → gallery.db                    RAG 入库
   ```
 - **设置界面**:转写语言/窗口、pyannote token、LLM 端点(任何 OpenAI 兼容 API)、字幕选项、chunk 参数、RAG 地址 —— 内置 **PointToFix Craft 安装器**(.exe 直链 / 本地路径 / 自动探测兄弟仓库便携包)。
 - **国际化**:中文 / English / Deutsch / 日本語,首次启动跟随系统,设置里可切换。
-- **无头 CLI** 供脚本与 AI 代理使用(`--start`、`--status`、`--tool-install`、`--tool-launch`),另有 `mrc-postprocess` CLI 重跑后处理。
+- **无头 CLI** 供脚本与 AI 代理使用(`--start`、`--status`、`--tool-install`、`--tool-launch`、`--fetch-models`),另有 `mrc-postprocess` CLI 重跑后处理。
 
 ## 环境要求
 
 - Windows 10/11 x64
 - 构建:Rust 2021(无需 CMake/libclang —— whisper.cpp 已移除)
-- 转写:无需自行下载模型 —— WanAI Runtime 网关自动下载并提供 SenseVoice(经 `[gateway]` 自动安装)
+- 转写:`mrc-recorder --fetch-models` 下载一次本地 SenseVoice 模型(hf-mirror;开会缺模型时也会自动下载)
 - 可选:python + `pyannote.audio`(说话人分离);任意 OpenAI 兼容 API key(LLM 总结)
 
 ## 从源码构建
@@ -93,8 +93,9 @@ mrc-recorder --start [--title X]   # 无头录音;stdout 输出 JSON 回执(退�
 mrc-recorder --status              # 最近 10 场会议 + 截图工具位置(JSON)
 mrc-recorder --tool-install [来源] # 安装/更新 PointToFix Craft(URL 或本地路径)
 mrc-recorder --tool-launch         # 启动截图工具
+mrc-recorder --fetch-models        # 下载本地 SenseVoice 模型(~230 MB,hf-mirror)
 
-mrc-recorder --transcribe <wav>        # 无头转写(网关 SenseVoice),JSON 段落输出
+mrc-recorder --transcribe <wav>        # 无头转写(本地 SenseVoice),JSON 段落输出
 mrc-postprocess list               # 会议列表
 mrc-postprocess run last           # (重)跑后处理;交互式命名
 mrc-postprocess run 3 --no-llm     # 不跑 LLM,只重建包

@@ -2,19 +2,13 @@
 # 全部字段都有默认值;最小可用只需填 [llm].api_key
 
 
-# ── wanai 网关(必要软件:转写/翻译引擎的宿主)──
-# ensure 三段式: /health 探测 → 本地 exe 自动拉起 → gh release 下载启动
-# (模型由网关按 config.yaml 声明自动下载;本项目不管理任何模型文件)
-[gateway]
-url = "http://127.0.0.1:17800"
-auto_start = true
-exe_path = ""              # 本地 exe 覆盖;留空自动探测(tools → 兄弟仓库)
-
 [stt]
-# 唯一 STT 引擎: wanai 网关 /asr(SenseVoice,实测 10.8s 音频 0.7s,带标点,zh/en/ja/ko/yue)
-# 网关地址在 [gateway].url 配置;未安装/未启动会自动拉起或从 release 下载安装
-gateway_url = "http://127.0.0.1:17800"   # 兼容回退,正式入口 [gateway].url
-language = "zh"          # zh / en / auto / ja / ko / yue
+# 本地 SenseVoice(sherpa-rs 进程内 ONNX,zh/en/ja/ko/yue,带标点)—— 唯一 STT 引擎
+# 模型缺失时: mrc-recorder --fetch-models 或开会自动下载(约 230 MB,经 hf-mirror)
+provider = "sensevoice"  # "sensevoice" | "none"(只录音归档)
+model_dir = ""           # 模型目录(需 model.int8.onnx + tokens.txt);留空自动找 data_dir\models\sensevoice
+language = "auto"        # auto / zh / en / ja / ko / yue
+num_threads = 2          # ONNX 推理线程数
 window_secs = 12.0       # 流式解码窗口
 
 [diarize]
@@ -74,10 +68,8 @@ pointtofix_url = ""
 pointtofix_exe = ""
 
 [translate]
-# 字幕实时翻译: "wanai"(本地网关 rs-aiprivaderCraft,opus-mt 本地模型,已实测)
-#              | "llm"(复用 [llm] 云端端点,术语更准) | "baidu" | "none"
-# wanai_mode = "api" 可经网关路由云端 LLM 翻译(准,联网)
-provider = "wanai"
+# 字幕实时翻译: "llm"(复用 [llm] 端点,编号批量,术语更准) | "baidu" | "none"
+provider = "none"
 from_lang = "zh"
 to_lang = "en"
 batch_size = 4              # llm provider 每次调用翻译的段数
@@ -85,7 +77,3 @@ batch_size = 4              # llm provider 每次调用翻译的段数
 appid = ""
 secret = ""
 api_url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
-# wanai 本地网关(M3 已就绪)
-wanai_url = "http://127.0.0.1:17800"
-wanai_model = ""            # 留空 = 网关 default
-wanai_mode = "local"        # local(opus-mt,快,离线) | api(网关路由云端 LLM,准)

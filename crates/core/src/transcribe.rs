@@ -1,46 +1,16 @@
-//! 流式转写(wanai 网关 /asr,SenseVoice,唯一 STT 引擎)。
+//! 流式转写(本地 SenseVoice,sherpa-rs 进内 ONNX,唯一 STT 引擎)。
 //!
-//! 策略:解码线程攒 window_secs(默认12s)送网关;取全部返回段的最后一段
+//! 策略:解码线程攒 window_secs(默认12s)送本地引擎;取全部返回段的最后一段
 //! 结束点 E 作为"已确定点",只落库 E 之前的段,把 E 之后的样本还回缓冲续传——
 //! 这样下个窗口从已确定点接着解,天然无重复。长静音由 capture::trim_silence 控制。
-//! 网关不可用时样本还回、下个 tick 重试(gateway::ensure 负责自动安装/拉起)。
+//! 引擎不可用时样本还回、下个 tick 重试。
+
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
 use crate::capture::TARGET_RATE;
-
-/// 把 16k mono f32 样本编码为 WAV 字节(网关 /asr 上传用)。
-pub fn encode_wav_16k(samples: &[f32]) -> Vec<u8> {
-    let data_len = samples.len() * 2;
-    let mut out = Vec::with_capacity(44 + data_len);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());      // fmt 块长
-    out.extend_from_slice(&1u16.to_le_bytes());       // PCM
-    out.extend_from_slice(&1u16.to_le_bytes());       // 单声道
-    out.extend_from_slice(&(TARGET_RATE as u32).to_le_bytes());
-    out.extend_from_slice(&(TARGET_RATE as u32 * 2).to_le_bytes()); // byte rate
-    out.extend_from_slice(&2u16.to_le_bytes());       // block align
-    out.extend_from_slice(&16u16.to_le_bytes());      // bits
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&(data_len as u32).to_le_bytes());
-    for s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
-
-/// 网关 /asr 执行器(SenseVoice,网关已就绪)。
-/// 契约:POST /asr?lang=xx,body = WAV 字节(任意采样率,网关混单声道);
-/// 响应 {"text": "...", "language": "..", "timestamps": ..., "ms": n}。
-pub struct RemoteAsr {
-    pub gateway_url: String,
-    pub language: String,
-    agent: ureq::Agent,
-}
+use crate::stt::LocalAsr;
 
 /// 已落库确定的转写段(会议相对毫秒)
 #[derive(Debug, Clone)]
@@ -48,85 +18,6 @@ pub struct RawSegment {
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
-}
-
-/// 远端返回的宽容段落(秒或毫秒都能吃)
-#[derive(Debug, Clone)]
-pub struct RemoteSegment {
-    pub start_ms: i64,
-    pub end_ms: i64,
-    pub text: String,
-}
-
-impl RemoteAsr {
-    pub fn new(gateway_url: &str, language: &str) -> Self {
-        Self {
-            gateway_url: gateway_url.trim_end_matches('/').to_string(),
-            language: language.to_string(),
-            agent: ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(120))
-                .build(),
-        }
-    }
-
-    pub fn transcribe(&self, samples: &[f32]) -> Result<Vec<RemoteSegment>> {
-        let wav = encode_wav_16k(samples);
-        let url = format!(
-            "{}/asr?lang={}",
-            self.gateway_url,
-            if self.language == "auto" { "auto" } else { &self.language }
-        );
-        let resp = self
-            .agent
-            .post(&url)
-            .set("Content-Type", "audio/wav")
-            .send_bytes(&wav)
-            .map_err(|e| anyhow::anyhow!("网关 {url} 不可用: {e}"))?;
-        let v: serde_json::Value = resp.into_json().context("网关 /asr 响应解析失败")?;
-        if let Some(err) = v["error"].as_object() {
-            anyhow::bail!(
-                "网关错误 [{}]: {}",
-                err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown"),
-                err.get("message").and_then(|m| m.as_str()).unwrap_or("?")
-            );
-        }
-        // 网关 v0.1 契约:整段 {text, language, timestamps, ms}(SenseVoice 全文)。
-        // 兼容未来分段形式 {segments:[{start,end,text}]}。
-        let dur_ms = (samples.len() as f64 / TARGET_RATE as f64 * 1000.0) as i64;
-        if let Some(arr) = v["segments"].as_array().or_else(|| v["data"].as_array()) {
-            let mut out = Vec::with_capacity(arr.len());
-            for seg in arr {
-                let get_ms = |a: &serde_json::Value, b: &str, c: &str| -> i64 {
-                    if let Some(x) = a[b].as_f64() {
-                        if x > 1000.0 { x as i64 } else { (x * 1000.0) as i64 }
-                    } else if let Some(x) = a[c].as_f64() {
-                        if x > 1000.0 { x as i64 } else { (x * 1000.0) as i64 }
-                    } else {
-                        0
-                    }
-                };
-                let text = seg["text"].as_str().unwrap_or("").trim().to_string();
-                if text.is_empty() {
-                    continue;
-                }
-                out.push(RemoteSegment {
-                    start_ms: get_ms(seg, "start", "start_ms"),
-                    end_ms: get_ms(seg, "end", "end_ms"),
-                    text,
-                });
-            }
-            return Ok(out);
-        }
-        let text = v["text"].as_str().unwrap_or("").trim().to_string();
-        if text.is_empty() {
-            return Ok(vec![]);
-        }
-        Ok(vec![RemoteSegment {
-            start_ms: 0,
-            end_ms: dur_ms,
-            text,
-        }])
-    }
 }
 
 /// 读取任意 WAV,重采样为 16k mono f32(离线转写用)。
@@ -179,8 +70,8 @@ pub fn load_wav_16k(path: &std::path::Path) -> Result<Vec<f32>> {
 
 /// 流式解码循环状态机:供解码线程每 tick 调用。
 pub struct Streaming {
-    /// wanai 网关执行器(唯一 STT 引擎;None = 只归档不转写)
-    pub remote: Option<RemoteAsr>,
+    /// 本地 SenseVoice 执行器(None = 只归档不转写)
+    pub asr: Option<Arc<LocalAsr>>,
     pub window_secs: f64,
     /// 已落库的最后确定点(会议相对毫秒)
     pub committed_ms: i64,
@@ -196,21 +87,21 @@ pub enum StreamEvent {
 }
 
 impl Streaming {
-    pub fn new(remote: Option<RemoteAsr>, window_secs: f64) -> Self {
+    pub fn new(asr: Option<Arc<LocalAsr>>, window_secs: f64) -> Self {
         Self {
-            remote,
+            asr,
             window_secs,
             committed_ms: 0,
         }
     }
 
-    /// 解码一窗:走网关 /asr(SenseVoice)。
+    /// 解码一窗:走本地 SenseVoice。
     pub fn decode_window(&self, buf: &[f32], buf_start_ms: i64) -> Result<Vec<RawSegment>> {
-        let remote = self
-            .remote
+        let asr = self
+            .asr
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("转写器未配置(网关 /asr)"))?;
-        let segs = remote.transcribe(buf)?;
+            .ok_or_else(|| anyhow::anyhow!("转写器未配置(本地 SenseVoice)"))?;
+        let segs = asr.transcribe(TARGET_RATE, buf)?;
         Ok(segs
             .into_iter()
             .map(|r| RawSegment {
@@ -227,7 +118,7 @@ impl Streaming {
         let win_samples = (self.window_secs * TARGET_RATE as f64) as usize;
 
         // 无转写器:只做静音裁剪(纯归档模式)
-        let Some(_) = self.remote.as_ref() else {
+        let Some(_) = self.asr.as_ref() else {
             cap.trim_silence(30.0, 5.0);
             return StreamEvent::Idle;
         };

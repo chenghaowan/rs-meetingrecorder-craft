@@ -27,7 +27,7 @@ CPAL capture                            Post-process
   ↓                                       ↓
 PCM buffer                              Chunk (5 min / 1000 tokens)
   ↓                                       ↓
-Gateway /asr streaming (SenseVoice)     Screenshot ↔ speech matching (±30 s)
+Local SenseVoice streaming (in-process)  Screenshot ↔ speech matching (±30 s)
   ↓                                       ↓
 Speaker diarization (pyannote add-on)   LLM summary — one call, structured JSON
   ↓                                       ↓
@@ -39,11 +39,11 @@ F8 screenshot → gallery.db            Ingest into RAG
 
 ## Features
 
-- **One STT engine, zero model management**: all speech-to-text routes to the WanAI Runtime gateway (`/asr`, SenseVoice-small — several times faster than whisper, punctuation included, zh/en/ja/ko/yue). If the gateway is missing it is auto-installed (see below); no STT model files ever live in this repo.
+- **One STT engine, fully local**: in-process SenseVoice-small via sherpa-onnx (CPU ONNX, no gateway, no server — several times faster than whisper was, punctuation included, zh/en/ja/ko/yue). Models are auto-downloaded once (~230 MB via hf-mirror) and managed by this app itself.
 
 - **Floating mini panel** (132×96, same size as PointToFix Craft's standby bar): status light, elapsed time, start/stop, always-on-top, draggable.
 - **Live subtitle bar** at the bottom of the screen (a second native viewport): last two transcript lines + a recording timer; on-top, font size, opacity and margin are configurable.
-- **Streaming transcription** via the gateway: 12 s sliding window with tail continuation — no duplicated segments; failed windows are retried without dropping audio.
+- **Streaming transcription**: 12 s sliding window with tail continuation — no duplicated segments; failed windows are retried without dropping audio.
 - **Speaker naming, the pragmatic way**: diarization only produces anonymous clusters (`SPEAKER_00`…); names come from a 10-second manual pass (sample utterances, known-name shortcuts), with **voiceprint matching** pre-filling names across meetings (192/512-dim embeddings stored as SQLite BLOBs, cosine brute-force — microseconds at hundreds of speakers).
 - **LLM minutes in one call**: long-context model summarizes the whole transcript at once and must return structured JSON (summary / decisions / actions / risks, each with an `evidence_time`); oversized transcripts automatically fall back to two halves + a merge pass.
 - **Meeting package** — plain files, no lock-in:
@@ -58,15 +58,13 @@ F8 screenshot → gallery.db            Ingest into RAG
   ```
 - **Settings GUI**: STT language/window, pyannote token, LLM endpoint (any OpenAI-compatible API), subtitle options, chunk parameters, RAG URL — plus a built-in **installer for PointToFix Craft** (direct .exe link, local path, or auto-detected sibling build).
 - **i18n**: 中文 / English / Deutsch / 日本語, following the system UI language on first start; switchable in Settings.
-- **Headless CLI** for scripts and AI agents (`--start`, `--status`, `--tool-install`, `--tool-launch`), plus a `mrc-postprocess` CLI for re-running the pipeline.
-
-- **Gateway as required software** (`[gateway]`): STT/translation engines live in the WanAI Runtime gateway. On startup and before every meeting: `/health` probe → if down, auto-start a locally detected exe → if none, `gh release download` the portable zip from the gateway repo (private-repo auth handled by gh CLI) and start it. Models (SenseVoice/opus-mt/BGE) download themselves inside the gateway; this repo ships no model files.
+- **Headless CLI** for scripts and AI agents (`--start`, `--status`, `--tool-install`, `--tool-launch`, `--fetch-models`), plus a `mrc-postprocess` CLI for re-running the pipeline.
 
 ## Requirements
 
 - Windows 10/11 x64
 - To build: Rust 2021 (no CMake/libclang needed — whisper.cpp is gone)
-- To transcribe: nothing to download yourself — the WanAI Runtime gateway fetches and serves SenseVoice (auto-installed via `[gateway]`)
+- To transcribe: run `mrc-recorder --fetch-models` once (SenseVoice downloads automatically via hf-mirror; meetings also auto-download when the model is missing)
 - Optional: python + `pyannote.audio` for speaker diarization; any OpenAI-compatible API key for the LLM summary
 
 ## Build from source
@@ -96,6 +94,7 @@ mrc-recorder --start [--title X]   # headless recording; JSON receipt on stdout 
 mrc-recorder --status              # last 10 meetings + screenshot tool location (JSON)
 mrc-recorder --tool-install [src]  # install/update PointToFix Craft (URL or local path)
 mrc-recorder --tool-launch         # launch the screenshot tool
+mrc-recorder --fetch-models        # download the local SenseVoice model (~230 MB, hf-mirror)
 
 mrc-recorder --transcribe <wav>        # headless offline transcription, JSON segments out
 mrc-postprocess list               # meeting list
@@ -109,10 +108,7 @@ mrc-postprocess rag 3              # retry RAG ingestion
 An AI-agent skill (`.agents/skills/meetingrecord`) documents the database/package contracts for automated retrieval.
 
 ## Live translation & window capture
-- **Local model translation** (`provider = "wanai"`): routes to the WanAI Runtime gateway (`rs-aiprivaderCraft`, `http://127.0.0.1:17800`) whose `/translate` serves a local opus-mt ONNX model - fully offline. Until the gateway ships its M3 translate endpoint, this provider silently degrades to no-translation. `provider = "llm"` remains the cloud alternative.
-
-
-- **Live subtitle translation** (`[translate]`): `provider = "llm"` reuses the `[llm]` OpenAI-compatible endpoint (zero-code switch once the unified model gateway rs-aiprivaderCraft is up); `"baidu"` uses the Baidu Translate Open API (same appid/secret as ltl-manage); `"none"` disables. LLM mode batches 3-5 lines per call and keeps engineering terms; translations land in `segments.translation`, the second subtitle line, and `transcript.json`.
+- **Live subtitle translation** (`[translate]`): `provider = "llm"` reuses the `[llm]` OpenAI-compatible endpoint (works with any cloud or local server); `"baidu"` uses the Baidu Translate Open API (same appid/secret as ltl-manage); `"none"` disables. LLM mode batches 3-5 lines per call and keeps engineering terms; translations land in `segments.translation`, the second subtitle line, and `transcript.json`.
 - **Window capture**: a window-title keyword is resolved to the exact visible rect (DWM frame bounds) and shot through pointtofixcraft's headless `--capture`. Three entry points: CLI `mrc-recorder --shot-window Teams [--shot-window-ocr]`; the 📷 button on the panel while recording; `auto_window_secs` periodic auto-shots. Occluded/minimized windows capture whatever is on screen in that region (inherent to region capture); per-window content capture is planned.
 
 ## Contracts with sibling tools

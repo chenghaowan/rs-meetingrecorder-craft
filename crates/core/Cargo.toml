@@ -21,3 +21,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
 ] }
+
+# 本地 STT:SenseVoice(sherpa-onnx;download-binaries 自动取预编译二进制)
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }

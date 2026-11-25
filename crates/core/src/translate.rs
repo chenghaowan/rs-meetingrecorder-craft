@@ -1,6 +1,5 @@
 //! 字幕实时翻译,双 provider:
-//! - "llm":复用 [llm] 的 OpenAI 兼容端点(rs-aiprivaderCraft 统一网关就位后指向它)。
-//!   编号批量翻译,一次调用翻 3~5 段,术语保留。
+//! - "llm":复用 [llm] 的 OpenAI 兼容端点。编号批量翻译,一次调用翻 3~5 段,术语保留。
 //! - "baidu":移植 ltl-manage utils/translator.py 的百度翻译开放 API
 //!   (appid+secret MD5 签名,兼容经典/AI 两种响应格式,进程内缓存)。
 //!
@@ -21,20 +20,10 @@ pub struct Translator {
     llm: Option<LlmCfg>,
     agent: ureq::Agent,
     cache: Mutex<HashMap<String, String>>,
-    wanai_url: String,
 }
 
 impl Translator {
     pub fn new(cfg: &TranslateCfg, llm: &LlmCfg) -> Result<Self> {
-        Self::with_gateway(cfg, llm, None)
-    }
-
-    /// gateway_url: [gateway].url 统一入口(None = 用 cfg.wanai_url)
-    pub fn with_gateway(
-        cfg: &TranslateCfg,
-        llm: &LlmCfg,
-        cfg_wanai_url: Option<&str>,
-    ) -> Result<Self> {
         match cfg.provider.as_str() {
             "none" | "" => bail!("翻译未启用"),
             "llm" => {
@@ -47,11 +36,6 @@ impl Translator {
                     bail!("provider=baidu 但 [translate] appid/secret 未配置");
                 }
             }
-            "wanai" => {
-                if cfg.wanai_url.trim().is_empty() && cfg_wanai_url.is_none() {
-                    bail!("provider=wanai 但网关地址未配置");
-                }
-            }
             other => bail!("未知翻译 provider: {other}(llm/baidu/none)"),
         }
         Ok(Self {
@@ -61,10 +45,6 @@ impl Translator {
                 .timeout(std::time::Duration::from_secs(30))
                 .build(),
             cache: Mutex::new(HashMap::new()),
-            wanai_url: cfg_wanai_url
-                .map(|s| s.trim().trim_end_matches('/').to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| cfg.wanai_url.trim().to_string()),
         })
     }
 
@@ -100,7 +80,6 @@ impl Translator {
         // 2) 未命中的按 provider 翻
         let res = match self.cfg.provider.as_str() {
             "baidu" => self.translate_batch_baidu(texts, &pending),
-            "wanai" => self.translate_batch_wanai(texts, &pending),
             _ => self.translate_batch_llm(texts, &pending),
         };
         if let Ok(values) = res {
@@ -167,64 +146,6 @@ impl Translator {
                 }
                 Err(e) => eprintln!("[translate] llm 批次失败: {e}"),
             }
-        }
-        Ok(values)
-    }
-
-    // ---------- wanai provider:本地网关(rs-aiprivaderCraft /translate,M3 已就绪) ----------
-    //
-    // 契约(网关 v0.1 实测):
-    //   POST {wanai_url}/translate
-    //   {"texts": ["..."], "direction": "en2zh"|"zh2en", "mode": "local|api(可选)", "model": "可选"}
-    //   → {"direction": "...", "via": "...", "results": ["..."], "ms": 123}
-    // local 模式按方向路由 opus-mt(translate-opus-en-zh / translate-opus-zh-en);
-    // 仅支持英<->中,其它方向由 llm/baidu provider 承担。
-
-    fn translate_batch_wanai(
-        &self,
-        texts: &[String],
-        idxs: &[usize],
-    ) -> Result<Vec<Option<String>>> {
-        let payload_texts: Vec<&str> = idxs.iter().map(|i| texts[*i].as_str()).collect();
-        let url = format!("{}/translate", self.wanai_url);
-        // 网关契约:direction = en2zh | zh2en(opus-mt 按方向分模型)
-        let direction = match (self.cfg.from_lang.as_str(), self.cfg.to_lang.as_str()) {
-            ("en", "zh") => "en2zh",
-            ("zh", "en") => "zh2en",
-            (f, t) => bail!("wanai 网关仅支持 en<->zh,当前 {}->{}(该方向请用 llm/baidu)", f, t),
-        };
-        let mut body = json!({
-            "texts": payload_texts,
-            "direction": direction,
-            "mode": if self.cfg.wanai_mode.trim() == "api" { "api" } else { "local" },
-        });
-        if !self.cfg.wanai_model.trim().is_empty() {
-            body["model"] = json!(self.cfg.wanai_model.trim());
-        }
-        let resp = self
-            .agent
-            .post(&url)
-            .send_json(&body)
-            .map_err(|e| anyhow!("本地网关 {url} 不可用: {e}"))?;
-        let v: serde_json::Value = resp.into_json().context("网关响应解析失败")?;
-        if let Some(err) = v["error"].as_object() {
-            bail!(
-                "网关错误 [{}]: {}",
-                err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown"),
-                err.get("message").and_then(|m| m.as_str()).unwrap_or("?")
-            );
-        }
-        // 兼容键名:translations / results / data
-        let arr = v["translations"]
-            .as_array()
-            .or_else(|| v["results"].as_array())
-            .or_else(|| v["data"].as_array());
-        let Some(arr) = arr else {
-            bail!("网关响应缺 translations: {}", truncate_json(&v));
-        };
-        let mut values: Vec<Option<String>> = Vec::with_capacity(idxs.len());
-        for k in 0..idxs.len() {
-            values.push(arr.get(k).and_then(|x| x.as_str()).map(|s| s.to_string()));
         }
         Ok(values)
     }
@@ -318,11 +239,6 @@ pub fn chat_text(llm: &LlmCfg, agent: &ureq::Agent, system: &str, user: &str) ->
         .as_str()
         .map(|s| s.trim().to_string())
         .ok_or_else(|| anyhow!("LLM 响应缺 content"))
-}
-
-fn truncate_json(v: &serde_json::Value) -> String {
-    let t = v.to_string();
-    t.chars().take(160).collect()
 }
 
 fn lang_name(code: &str) -> &'static str {

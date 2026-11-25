@@ -20,10 +20,12 @@ use mrc_core::capture;
 use mrc_core::config::Config;
 use mrc_core::db;
 use mrc_core::pipeline::{self, PipelineStop};
-use mrc_core::transcribe::{RemoteAsr, Streaming};
+use mrc_core::stt::LocalAsr;
+use mrc_core::transcribe::{load_wav_16k, Streaming};
 use mrc_core::tools;
 use mrc_core::translate::Translator;
 use mrc_core::windowcap;
+use std::sync::Arc;
 
 use crate::i18n::Lang;
 
@@ -36,11 +38,11 @@ pub enum CliAction {
     /// 工具子命令(安装/启动 pointtofixcraft)
     ToolInstall { src: Option<String> },
     ToolLaunch,
-    /// 网关确保就绪(status 只看,start 会拉起/下载)
-    GatewayStart,
+    /// 下载本地模型(SenseVoice 转写;后续扩展 VAD/diarization)
+    FetchModels,
     /// 指定窗口截图(经 pointtofixcraft 落库)
     ShotWindow { keyword: String, ocr: bool },
-    /// 无头转写一个 WAV(走网关 /asr),stdout 输出 JSON 段落
+    /// 无头转写一个 WAV(本地 SenseVoice),stdout 输出 JSON 段落
     Transcribe { wav: String },
     Bad(String),
 }
@@ -69,7 +71,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliAction {
                 return CliAction::ToolInstall { src: args.get(i).cloned() };
             }
             "--tool-launch" => return CliAction::ToolLaunch,
-            "--gateway" => return CliAction::GatewayStart,
+            "--fetch-models" => return CliAction::FetchModels,
             "--transcribe" => {
                 i += 1;
                 let wav = args.get(i).cloned()
@@ -150,9 +152,9 @@ pub fn run(action: CliAction) -> i32 {
                 1
             }
         },
-        CliAction::GatewayStart => match mrc_core::gateway::ensure(&cfg) {
-            Ok(msg) => {
-                println!("gateway: {msg}");
+        CliAction::FetchModels => match mrc_core::stt::install_model(&cfg) {
+            Ok(p) => {
+                println!("models: {}", p.display());
                 0
             }
             Err(e) => {
@@ -172,8 +174,8 @@ pub fn run(action: CliAction) -> i32 {
         },
         CliAction::Bad(msg) => {
             eprintln!("参数错误: {msg}");
-            eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --shot-window 关键词 [--shot-window-ocr] | --transcribe <wav>]");
-    eprintln!("  [stt] 唯一引擎 = wanai 网关 /asr(SenseVoice);--gateway 确保就绪(健康检查→本地启动→release 自动下载)");
+            eprintln!("用法: mrc-recorder [--start [--title X] | --status | --tool-install [来源] | --tool-launch | --fetch-models | --shot-window 关键词 [--shot-window-ocr] | --transcribe <wav>]");
+    eprintln!("  [stt] 唯一引擎 = 本地 SenseVoice(sherpa-rs 进程内 ONNX);--fetch-models 从 hf-mirror 下载模型(约 230 MB)");
             2
         }
         CliAction::Gui => 0,
@@ -181,14 +183,13 @@ pub fn run(action: CliAction) -> i32 {
 }
 
 fn cmd_transcribe(cfg: &Config, wav: &str) -> Result<serde_json::Value> {
-    use mrc_core::transcribe::{load_wav_16k, RemoteAsr};
-    let _ = mrc_core::gateway::ensure(cfg); // 未就绪就拉起/自动安装;失败由下面的 /asr 报错暴露
     let samples = load_wav_16k(std::path::Path::new(wav))?;
     let dur = samples.len() as f64 / 16000.0;
+    let asr = LocalAsr::from_config(cfg)?
+        .ok_or_else(|| anyhow::anyhow!("STT 未启用(provider=none);模型缺失时先跑 mrc-recorder --fetch-models"))?;
     let t0 = std::time::Instant::now();
-    let asr = RemoteAsr::new(&cfg.gateway_url(), &cfg.stt.language);
     let segs = asr
-        .transcribe(&samples)?
+        .transcribe(16000, &samples)?
         .into_iter()
         .map(|s| mrc_core::transcribe::RawSegment {
             start_ms: s.start_ms,
@@ -208,7 +209,7 @@ fn cmd_transcribe(cfg: &Config, wav: &str) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "wav": wav,
         "duration_s": (dur * 10.0).round() / 10.0,
-        "engine": "wanai-gateway/sensevoice",
+        "engine": "local/sensevoice",
         "elapsed_s": (elapsed * 10.0).round() / 10.0,
         "segments": items,
     }))
@@ -265,10 +266,12 @@ fn cmd_status(cfg: &Config) -> i32 {
 /// 无头录音:交互终端=回车结束;无控制台调用方(ltl 页面)传 --stop-file,
 /// 主循环轮询文件存在即结束 → 后处理 → JSON 回执
 fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Result<serde_json::Value> {
-    // 网关兜底(STT 唯一引擎在网关上;ensure 会自动拉起/安装)
-    match mrc_core::gateway::ensure(cfg) {
-        Ok(msg) => eprintln!("[gateway] {msg}"),
-        Err(e) => eprintln!("[gateway] 未就绪: {e:#}(转写降级为只归档,期间持续重试)"),
+    // 模型兜底:缺 SenseVoice 模型先自动下载(一次性,可能耗时)
+    if mrc_core::stt::enabled(&cfg.stt) && mrc_core::stt::resolve_dir(cfg).is_none() {
+        match mrc_core::stt::install_model(cfg) {
+            Ok(p) => eprintln!("[stt] 模型就绪: {}", p.display()),
+            Err(e) => eprintln!("[stt] 模型缺失: {e:#}(本次只录音归档,不转写)"),
+        }
     }
     let now = db::now_ms();
     let title = title
@@ -285,10 +288,10 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
     let (done_tx, done_rx) = mpsc::channel::<Result<()>>();
     let cfg2 = cfg.clone();
     let shared2 = shared.clone();
-    let translator = Translator::with_gateway(&cfg2.translate, &cfg2.llm, Some(&cfg2.gateway_url())).ok();
-    let remote_asr = Some(RemoteAsr::new(&cfg2.gateway_url(), &cfg2.stt.language));
+    let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+    let asr = LocalAsr::from_config(&cfg2).ok().flatten().map(Arc::new);
     std::thread::spawn(move || {
-        let mut streaming = Streaming::new(remote_asr, cfg2.stt.window_secs);
+        let mut streaming = Streaming::new(asr, cfg2.stt.window_secs);
         let mut idx: i64 = 0;
         let res = (|| -> Result<()> {
             let conn = db::open(&cfg2.db_path())?;

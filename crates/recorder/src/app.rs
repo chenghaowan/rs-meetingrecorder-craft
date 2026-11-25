@@ -16,7 +16,8 @@ use mrc_core::capture::{self, CaptureShared};
 use mrc_core::config::Config;
 use mrc_core::db;
 use mrc_core::pipeline::{self, PipelineStop};
-use mrc_core::transcribe::{RemoteAsr, Streaming};
+use mrc_core::stt::LocalAsr;
+use mrc_core::transcribe::Streaming;
 use mrc_core::translate::Translator;
 use mrc_core::{tools, windowcap};
 
@@ -160,8 +161,6 @@ struct Draft {
     tr_to: String,
     tr_appid: String,
     tr_secret: String,
-    gw_url: String,
-    gw_auto_start: bool,
     shots_default_win: String,
     shots_auto: String,
 }
@@ -196,8 +195,6 @@ impl Draft {
             tr_to: c.translate.to_lang.clone(),
             tr_appid: c.translate.appid.clone(),
             tr_secret: c.translate.secret.clone(),
-            gw_url: c.gateway.url.clone(),
-            gw_auto_start: c.gateway.auto_start,
             shots_default_win: c.shots.default_window.clone(),
             shots_auto: c.shots.auto_window_secs.to_string(),
         }
@@ -233,18 +230,9 @@ impl Draft {
         c.lang = Some(self.lang_code.clone()).filter(|s| !s.is_empty());
         let prov = self.tr_provider.trim();
         c.translate.provider = match prov {
-            "llm" | "baidu" | "wanai" => prov.to_string(),
+            "llm" | "baidu" => prov.to_string(),
             _ => "none".to_string(),
         };
-        c.gateway.url = if self.gw_url.trim().is_empty() {
-            "http://127.0.0.1:17800".into()
-        } else {
-            self.gw_url.trim().into()
-        };
-        c.gateway.auto_start = self.gw_auto_start;
-        // 旧字段同步(兼容回退读取)
-        c.translate.wanai_url = c.gateway.url.clone();
-        c.stt.gateway_url = c.gateway.url.clone();
         c.translate.from_lang = if self.tr_from.trim().is_empty() { "zh".into() } else { self.tr_from.trim().into() };
         c.translate.to_lang = if self.tr_to.trim().is_empty() { "en".into() } else { self.tr_to.trim().into() };
         c.translate.appid = self.tr_appid.trim().to_string();
@@ -356,13 +344,14 @@ impl App {
     }
 
     fn try_start_meeting(&mut self) -> Result<()> {
-        // 网关兜底(后台预热可能还没完成/失败):阻塞至多 30s,换取会议全程可用。
-        // STT 只走网关(SenseVoice);ensure 会自动拉起/安装网关,失败则降级为只归档。
-        match mrc_core::gateway::ensure(&self.cfg) {
-            Ok(msg) => self.notice = Some((false, format!("网关: {msg}"))),
-            Err(e) => {
-                let tr = self.lang.strings();
-                self.notice = Some((true, format!("{}: {e:#}", tr.err_tr_disabled)));
+        // 模型兜底:缺 SenseVoice 模型先同步下载(一次性;失败降级为只归档)
+        if mrc_core::stt::enabled(&self.cfg.stt) && mrc_core::stt::resolve_dir(&self.cfg).is_none() {
+            match mrc_core::stt::install_model(&self.cfg) {
+                Ok(p) => self.notice = Some((false, format!("模型就绪: {}", p.display()))),
+                Err(e) => {
+                    let tr = self.lang.strings();
+                    self.notice = Some((true, format!("{}: {e:#}", tr.err_tr_disabled)));
+                }
             }
         }
         let now = db::now_ms();
@@ -384,15 +373,15 @@ impl App {
         let cfg2 = self.cfg.clone();
         let live2 = std::sync::Arc::clone(&self.live);
         let shared2 = shared.clone();
-        let translator = Translator::with_gateway(&cfg2.translate, &cfg2.llm, Some(&cfg2.gateway_url())).ok();
-        let remote_asr = Some(RemoteAsr::new(&cfg2.gateway_url(), &cfg2.stt.language));
+        let translator = Translator::new(&cfg2.translate, &cfg2.llm).ok();
+        let asr = LocalAsr::from_config(&cfg2).ok().flatten().map(std::sync::Arc::new);
         // 自动截图(指定窗口,防漏截):间隔 0=关;pointtofix 缺失时静默跳过
         let auto_shots = cfg2.shots.auto_window_secs > 0.0 && !cfg2.shots.default_window.trim().is_empty();
         let shot_every = std::time::Duration::from_secs_f64(cfg2.shots.auto_window_secs.max(1.0));
         let mut last_shot = std::time::Instant::now() - shot_every; // 首个 tick 立即截一张
         let pf_exe = tools::resolve_available(&cfg2);
         std::thread::spawn(move || {
-            let mut streaming = Streaming::new(remote_asr, cfg2.stt.window_secs);
+            let mut streaming = Streaming::new(asr, cfg2.stt.window_secs);
             let mut idx: i64 = 0;
             let res = (|| -> Result<()> {
                 let conn = db::open(&cfg2.db_path())?;
@@ -1090,27 +1079,6 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                 |ui| {
                     let Some(d) = app.draft.as_mut() else { return };
                     ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                        ui.heading(tr.sec_gateway);
-                        let gw_alive = mrc_core::gateway::health(&app.cfg.gateway_url(), std::time::Duration::from_millis(800));
-                        ui.label(
-                            RichText::new(if gw_alive { tr.gateway_online } else { tr.gateway_offline })
-                                .size(12.0)
-                                .color(if gw_alive { Color32::from_rgb(140, 200, 160) } else { Color32::from_rgb(240, 160, 90) }),
-                        );
-                        row(ui, tr.lbl_gateway_url, &mut d.gw_url, tr.hint_gateway_url);
-                        ui.checkbox(&mut d.gw_auto_start, tr.lbl_gw_auto_start);
-                        ui.horizontal(|ui| {
-                            if ui.add(egui::Button::new(tr.btn_gateway_start)).clicked() {
-                                let cfg = app.cfg.clone();
-                                std::thread::spawn(move || {
-                                    match mrc_core::gateway::ensure(&cfg) {
-                                        Ok(msg) => println!("[gateway] {msg}"),
-                                        Err(e) => eprintln!("[gateway] {e:#}"),
-                                    }
-                                });
-                            }
-                        });
-                        ui.separator();
                         ui.heading(tr.sec_stt);
                         row(ui, tr.lbl_language, &mut d.stt_lang, "zh / en / auto");
                         row(ui, tr.lbl_window, &mut d.stt_window, "12");
@@ -1149,14 +1117,12 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                                 .selected_text(match prov.as_str() {
                                     "llm" => "LLM",
                                     "baidu" => "Baidu",
-                                    "wanai" => "WanAI (local)",
                                     _ => "off",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut prov, "none".to_string(), "off");
                                     ui.selectable_value(&mut prov, "llm".to_string(), "LLM");
                                     ui.selectable_value(&mut prov, "baidu".to_string(), "Baidu");
-                                    ui.selectable_value(&mut prov, "wanai".to_string(), "WanAI (local)");
                                 });
                             d.tr_provider = prov;
                         });

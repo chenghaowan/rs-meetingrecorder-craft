@@ -9,20 +9,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SttCfg {
-    /// 转写语言(zh/en/auto…)
+    /// "sensevoice"(本地 sherpa-rs,进程内 ONNX) | "none"(只录音归档)
+    pub provider: String,
+    /// 模型目录(需 model.int8.onnx + tokens.txt);留空自动找
+    /// data_dir/models/sensevoice、exe 旁 models/sensevoice、cwd models/sensevoice
+    pub model_dir: Option<PathBuf>,
+    /// 识别语言:auto/zh/en/ja/ko/yue
     pub language: String,
-    /// 实时解码窗口秒数:攒够这么长就送网关 /asr,并把已确定的尾巴提交
+    /// 推理线程数
+    pub num_threads: u32,
+    /// 实时解码窗口秒数:攒够这么长就送本地引擎,并把已确定的尾巴提交
     pub window_secs: f64,
-    /// wanai 网关地址(兼容回退用;正式入口是 [gateway].url)
-    pub gateway_url: String,
 }
 
 impl Default for SttCfg {
     fn default() -> Self {
         Self {
-            language: "zh".into(),
+            provider: "sensevoice".into(),
+            model_dir: None,
+            language: "auto".into(),
+            num_threads: 2,
             window_secs: 12.0,
-            gateway_url: "http://127.0.0.1:17800".into(),
         }
     }
 }
@@ -156,7 +163,7 @@ pub struct Config {
     /// 会议包根目录(默认 data_dir/packages)
     pub packages_dir: Option<PathBuf>,
 
-    /// STT(SenseVoice,走 wanai 网关;alias 兼容旧 [whisper] 段)
+    /// STT(SenseVoice 本地 sherpa-rs;alias 兼容旧 [whisper] 段)
     #[serde(alias = "whisper")]
     pub stt: SttCfg,
     pub diarize: DiarizeCfg,
@@ -170,8 +177,6 @@ pub struct Config {
     pub lang: Option<String>,
     /// 字幕实时翻译
     pub translate: TranslateCfg,
-    /// wanai 网关(必要软件:统一地址/自动启动/release 下载)
-    pub gateway: GatewayCfg,
     /// 底部字幕条
     pub subtitle: SubtitleCfg,
     /// 外部工具(pointtofixcraft 截图)
@@ -192,12 +197,6 @@ pub struct TranslateCfg {
     pub appid: String,
     pub secret: String,
     pub api_url: String,
-    /// wanai 本地网关(rs-aiprivaderCraft /translate,opus-mt 本地 ONNX)
-    pub wanai_url: String,
-    /// 留空 = 网关 default 模型(如 translate-opus-en-zh)
-    pub wanai_model: String,
-    /// wanai 翻译执行模式:"local"(opus-mt,快,术语一般) | "api"(网关路由云端 LLM,准,联网)
-    pub wanai_mode: String,
 }
 
 impl Default for TranslateCfg {
@@ -210,34 +209,6 @@ impl Default for TranslateCfg {
             appid: String::new(),
             secret: String::new(),
             api_url: "https://fanyi-api.baidu.com/api/trans/vip/translate".into(),
-            wanai_url: "http://127.0.0.1:17800".into(),
-            wanai_model: String::new(),
-            wanai_mode: "local".into(),
-        }
-    }
-}
-
-/// wanai 网关配置(地址统一从这里取;stt/translate 段的旧 url 字段仅兼容读取)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GatewayCfg {
-    pub url: String,
-    /// 未启动时自动探测本地 exe / 下载 release 启动
-    pub auto_start: bool,
-    /// 本地 exe 覆盖;留空自动探测
-    pub exe_path: Option<PathBuf>,
-    /// 关闭兄弟仓库开发版探测(默认 false;测试 release 下载路径用)
-    #[serde(default)]
-    pub dev_probe_disabled: bool,
-}
-
-impl Default for GatewayCfg {
-    fn default() -> Self {
-        Self {
-            url: "http://127.0.0.1:17800".into(),
-            auto_start: true,
-            exe_path: None,
-            dev_probe_disabled: false,
         }
     }
 }
@@ -327,7 +298,6 @@ impl Default for Config {
             subtitle: SubtitleCfg::default(),
             tools: ToolsCfg::default(),
             translate: TranslateCfg::default(),
-            gateway: GatewayCfg::default(),
         }
     }
 }
@@ -382,20 +352,6 @@ impl Config {
         self.audio_dir
             .clone()
             .unwrap_or_else(|| self.data_dir().join("audio"))
-    }
-
-    /// 网关地址统一入口([gateway].url;缺省回退旧字段保持兼容)
-    pub fn gateway_url(&self) -> String {
-        if !self.gateway.url.trim().is_empty() {
-            return self.gateway.url.trim().trim_end_matches('/').to_string();
-        }
-        if !self.stt.gateway_url.trim().is_empty() {
-            return self.stt.gateway_url.trim().to_string();
-        }
-        if !self.translate.wanai_url.trim().is_empty() {
-            return self.translate.wanai_url.trim().to_string();
-        }
-        "http://127.0.0.1:17800".into()
     }
 
     pub fn packages_dir(&self) -> PathBuf {
