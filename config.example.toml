@@ -24,28 +24,41 @@ threshold = 0.5          # 聚类阈值(簇数未知走阈值模式;越小簇越
 cross_match = 0.4        # 跨流(mic/remote)簇质心合并的余弦阈值
 
 [llm]
-# OpenAI 兼容端点(dashscope / deepseek / ollama / vllm 均可)
+# 会议总结引擎:"api"(OpenAI 兼容端点,dashscope / deepseek / ollama / vllm 均可)
+#             | "local"(llama-server + 本地 GGUF,离线;设置里可一键下载推荐模型)
+provider = "api"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-api_key = ""             # 必填才能出 LLM 总结
-model = "qwen-long"      # 长上下文模型优先(15万字转写要 >=128k 上下文)
+api_key = ""             # provider="api" 时必填才能出 LLM 总结
+model = "qwen-long"      # api:长上下文模型优先(15万字转写要 >=128k 上下文)
 temperature = 0.2
 timeout_secs = 300
-context_tokens = 200000  # 超过 0.8 倍自动降级为两段总结+合并
+context_tokens = 200000  # 超过 0.8 倍自动降级为两段总结+合并;provider=local 时自动跟 [llm.local].ctx 同步
 json_schema = true       # 端点不支持 json_schema 时改 false
 max_retries = 3
+
+[llm.local]
+# provider="local" 参数。模型按独显显存自动分档(DXGI 探测,设置里"下载推荐模型"一键下载):
+#   ≥11GB → Qwen3-8B   Q4_K_M 4.7GB  https://hf-mirror.com/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf  (ctx 32768)
+#   ≥7.5GB → Qwen3-8B  Q4_K_M 4.7GB  同上(ctx 16384;8GB 卡装得下 8B+KV)
+#   ≥5GB  → Qwen3-4B-Instruct-2507 Q4_K_M 2.3GB  https://hf-mirror.com/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+#   核显/无独显 → Qwen3-1.7B Q4_K_M 1.0GB  https://hf-mirror.com/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf
+# llama-server.exe(Vulkan 包)与字幕翻译共用:https://github.com/ggml-org/llama.cpp/releases(无 GPU 自动走 CPU)
+server_exe = ""          # 留空自动找 data_dir\tools\llama-vulkan\llama-server.exe
+model_path = ""          # 留空自动找 data_dir\models\llm\*.gguf(下载后设置里会自动填)
+port = 17811
+ngl = 99                 # GPU 卸载层数(99=全部进显存;核显用共享内存)
+ctx = 32768              # 两段总结降级阈值同步用这个;按推荐档自动填
 
 [shots]
 # pointtofixcraft 的截图库;留空用默认 %APPDATA%\pointtofix\gallery.db
 db_path = ""
 root = ""
 context_window_secs = 30.0   # 截图时刻 ±N 秒的发言作为 context
-default_window = ""          # 指定窗口截图:窗口标题关键词(如 "飞书");面板📷/CLI/自动截图共用
+default_window = ""          # ✂/📷/自动截图都只截此窗口(标题关键词,如 "Teams";设置里可从运行中窗口挑选);留空 = ✂ 截全屏
 auto_window_secs = 0         # 会议中自动截该窗口的间隔秒;0=关闭
-
-[rag]
-# ym3dRagCraft 的 /ingest 基址;留空跳过入库
-base_url = ""
-timeout_secs = 60
+embed_minutes_images = false # minutes.md 里截图转 webp base64 内嵌(单文件便携;
+                             # 实测 Tinta/Nomo 等部分阅读器不支持 data URI,默认关闭;
+                             # 文件引用是标准 markdown 图片语法,Nomo 可正常渲染)
 
 [post]
 chunk_window_secs = 300.0    # chunk 时间窗
@@ -74,9 +87,9 @@ pointtofix_exe = ""
 
 [translate]
 # 字幕实时翻译: "local"(llama-server + Hy-MT3,本机 GPU,离线,自动拉起 127.0.0.1:17810)
-#             | "llm"(复用 [llm] 端点,编号批量,术语更准) | "baidu" | "none"
+#             | "llm"(复用 [llm] API 端点,编号批量,术语更准) | "baidu" | "none"
 provider = "none"
-from_lang = "zh"
+from_lang = "auto"       # 源语言自动识别(MT3 模板本不需要;百度 API 用 auto),无需修改
 to_lang = "en"
 batch_size = 4              # llm provider 每次调用翻译的段数
 # baidu 凭据(与 ltl-manage .env 同一套)

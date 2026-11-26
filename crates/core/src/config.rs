@@ -54,6 +54,8 @@ impl Default for DiarizeCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmCfg {
+    /// "api"(OpenAI 兼容端点)| "local"(llama-server + 本地 GGUF,离线)
+    pub provider: String,
     /// OpenAI 兼容端点,如 https://dashscope.aliyuncs.com/compatible-mode/v1
     pub base_url: String,
     pub api_key: String,
@@ -65,11 +67,14 @@ pub struct LlmCfg {
     /// true=response_format json_schema;部分端点不支持时改 false(用 json_object+提示词)
     pub json_schema: bool,
     pub max_retries: u32,
+    /// local provider 参数
+    pub local: LocalLlmCfg,
 }
 
 impl Default for LlmCfg {
     fn default() -> Self {
         Self {
+            provider: "api".into(),
             base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
             api_key: String::new(),
             model: "qwen-long".into(),
@@ -78,7 +83,29 @@ impl Default for LlmCfg {
             context_tokens: 200_000,
             json_schema: true,
             max_retries: 3,
+            local: LocalLlmCfg::default(),
         }
+    }
+}
+
+/// 本地 LLM 总结(llama-server + GGUF;llama-server.exe 与翻译共用同一个包)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalLlmCfg {
+    /// llama-server.exe 路径;留空自动找 data_dir\tools\llama-vulkan(翻译同款)
+    pub server_exe: Option<PathBuf>,
+    /// GGUF 模型路径;留空自动找 data_dir\models\llm\*.gguf
+    pub model_path: Option<PathBuf>,
+    pub port: u16,
+    /// GPU 卸载层数(99=全部)
+    pub ngl: i32,
+    /// 上下文窗口;两段式降级阈值同步用这个
+    pub ctx: u32,
+}
+
+impl Default for LocalLlmCfg {
+    fn default() -> Self {
+        Self { server_exe: None, model_path: None, port: 17811, ngl: 99, ctx: 32768 }
     }
 }
 
@@ -95,6 +122,9 @@ pub struct ShotsCfg {
     pub default_window: String,
     /// 会议中自动截指定窗口的间隔秒;0=关闭(防漏截,截图落 gallery 由会议包自动关联)
     pub auto_window_secs: f64,
+    /// minutes.md 里把截图转 webp base64 内嵌(单文件便携;部分阅读器如 Tinta
+    /// 不支持 data URI,默认关闭用文件引用)
+    pub embed_minutes_images: bool,
 }
 
 impl Default for ShotsCfg {
@@ -105,21 +135,8 @@ impl Default for ShotsCfg {
             context_window_secs: 30.0,
             default_window: String::new(),
             auto_window_secs: 0.0,
+            embed_minutes_images: false,
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RagCfg {
-    /// ym3dRagCraft 的 /ingest 基址,如 http://127.0.0.1:8720;留空=不入库
-    pub base_url: Option<String>,
-    pub timeout_secs: u64,
-}
-
-impl Default for RagCfg {
-    fn default() -> Self {
-        Self { base_url: None, timeout_secs: 60 }
     }
 }
 
@@ -184,7 +201,6 @@ pub struct Config {
     pub diarize: DiarizeCfg,
     pub llm: LlmCfg,
     pub shots: ShotsCfg,
-    pub rag: RagCfg,
     pub post: PostCfg,
     /// 主悬浮窗置顶
     pub main_on_top: bool,
@@ -223,8 +239,9 @@ impl Default for LocalTranslateCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TranslateCfg {
-    /// "local"(llama-server + Hy-MT3,本机 GPU) | "llm"(复用 [llm] 端点) | "baidu" | "none"
+    /// "local"(llama-server + Hy-MT3,本机 GPU) | "llm"(复用 [llm] API 端点) | "baidu" | "none"
     pub provider: String,
+    /// 源语言;"auto" = 自动识别输入语言(Hy-MT3 模板本就不需要源语言;百度 API 也接受 auto)
     pub from_lang: String,
     pub to_lang: String,
     /// llm provider:每次调用翻译的段数
@@ -241,7 +258,7 @@ impl Default for TranslateCfg {
     fn default() -> Self {
         Self {
             provider: "none".into(),
-            from_lang: "zh".into(),
+            from_lang: "auto".into(),
             to_lang: "en".into(),
             batch_size: 4,
             appid: String::new(),
@@ -299,26 +316,14 @@ impl Default for Config {
             stt: SttCfg::default(),
             capture: CaptureCfg::default(),
             diarize: DiarizeCfg::default(),
-            llm: LlmCfg {
-                base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
-                api_key: String::new(),
-                model: "qwen-long".into(),
-                temperature: 0.2,
-                timeout_secs: 300,
-                context_tokens: 200_000,
-                json_schema: true,
-                max_retries: 3,
-            },
+            llm: LlmCfg::default(),
             shots: ShotsCfg {
                 db_path: None,
                 root: None,
                 context_window_secs: 30.0,
                 default_window: String::new(),
                 auto_window_secs: 0.0,
-            },
-            rag: RagCfg {
-                base_url: None,
-                timeout_secs: 60,
+                embed_minutes_images: false,
             },
             post: PostCfg {
                 chunk_window_secs: 300.0,

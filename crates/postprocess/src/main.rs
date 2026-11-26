@@ -2,12 +2,11 @@
 //!
 //! 用法:
 //!   mrc-postprocess list [--json]                      # 会议列表
-//!   mrc-postprocess run <id|last> [--no-llm] [--no-rag] [--non-interactive] [--json]
+//!   mrc-postprocess run <id|last> [--no-llm] [--non-interactive] [--json]
 //!   mrc-postprocess name <id> SPEAKER_00 张三  # 设说话人名
 //!   mrc-postprocess speak <id> SPEAKER_00 [--json]    # 看该说话人的样例发言(对号用)
 //!   mrc-postprocess package <id>              # 只重建会议包(不跑 LLM)
 //!   mrc-postprocess package-read <id|last> [--json]   # 读会议包内容(转写/总结/行动项/截图)
-//!   mrc-postprocess rag <id>                  # 重试 RAG 入库
 //!   mrc-postprocess fixture-shots             # 生成测试用 gallery.db(联调截图链路)
 
 use anyhow::{bail, Context, Result};
@@ -58,7 +57,6 @@ fn run() -> Result<()> {
             let (rest, _json) = split_json_flag(&args[1..]);
             cmd_package_read(&cfg, &rest)
         }
-        "rag" => cmd_rag(&cfg, &args[1..]),
         "fixture-shots" => cmd_fixture_shots(&cfg, &args[1..]),
         "init-config" => {
             let p = Config::config_path();
@@ -67,7 +65,7 @@ fn run() -> Result<()> {
             }
             Config::save_example(&p)?;
             println!("已生成示例配置: {}", p.display());
-            println!("请填 [llm] api_key、[diarize] hf_token、[rag] base_url");
+            println!("请配置 [llm](api_key 或 provider=\"local\")");
             Ok(())
         }
         _ => {
@@ -81,17 +79,16 @@ fn print_help() {
     println!(
         r#"mrc-postprocess — 会议后处理 CLI
 
-  init-config                    生成示例 config.toml(填 api_key 等)
+  init-config                    生成示例 config.toml(配置 [llm] 后可出总结)
   list [--json]                  会议列表
-  run <id|last> [--no-llm] [--no-rag] [--non-interactive] [--json]
+  run <id|last> [--no-llm] [--non-interactive] [--json]
                                  跑/重跑后处理流水线
   name <id> <SPEAKER_XX> <名字>  命名说话人(多次调用)
   speak <id> <SPEAKER_XX> [--json]
                                  打印该说话人样例发言(帮对号)
-  package <id>                   只重建会议包(截图+骨架 JSON,不跑 LLM)
+  package <id>                   只重建会议包(截图+骨架 JSON+minutes.md,不跑 LLM)
   package-read <id|last> [--json]
                                  读会议包内容(转写/总结/行动项/截图), 供页面解析
-  rag <id>                       重试 RAG 入库
   fixture-shots <目录>           造测试 gallery.db(截图链路联调)"#
     );
 }
@@ -149,13 +146,11 @@ fn cmd_list(cfg: &Config, json: bool) -> Result<()> {
 
 fn cmd_run(cfg: &Config, args: &[String], json: bool) -> Result<()> {
     let mut skip_llm = false;
-    let mut skip_rag = false;
     let mut interactive = true;
     let mut spec = None;
     for a in args {
         match a.as_str() {
             "--no-llm" => skip_llm = true,
-            "--no-rag" => skip_rag = true,
             "--non-interactive" => interactive = false,
             _ if spec.is_none() => spec = Some(a.clone()),
             _ => {}
@@ -164,7 +159,7 @@ fn cmd_run(cfg: &Config, args: &[String], json: bool) -> Result<()> {
     let spec = spec.context("缺会议 id(数字或 last)")?;
     let conn = db::open(&cfg.db_path())?;
     let id = resolve_meeting(&conn, &spec)?;
-    match pipeline::run(cfg, &mut db::open(&cfg.db_path())?, id, interactive, skip_llm, skip_rag) {
+    match pipeline::run(cfg, &mut db::open(&cfg.db_path())?, id, interactive, skip_llm) {
         Ok(r) => {
             if json {
                 println!("{}", serde_json::to_string(&r)?);
@@ -295,19 +290,9 @@ fn cmd_package_read(cfg: &Config, args: &[String]) -> Result<()> {
 fn cmd_package(cfg: &Config, args: &[String]) -> Result<()> {
     let spec = args.first().context("缺会议 id")?;
     let conn = db::open(&cfg.db_path())?;
-    let id = resolve_meeting(&conn, spec)?;
-    // 不跑 LLM 不入库,只重建包(summary 沿用库里已有的)
-    let r = pipeline::run(cfg, &mut db::open(&cfg.db_path())?, id, false, true, true)
-        .map_err(|(e, _)| e)?;
-    println!("{r}");
-    Ok(())
-}
-
-fn cmd_rag(cfg: &Config, args: &[String]) -> Result<()> {
-    let spec = args.first().context("缺会议 id")?;
-    let conn = db::open(&cfg.db_path())?;
-    let id = resolve_meeting(&conn, spec)?;
-    let r = pipeline::run(cfg, &mut db::open(&cfg.db_path())?, id, false, true, false)
+    let id = resolve_meeting(&conn, &spec)?;
+    // 不跑 LLM,只重建包(summary 沿用库里已有的)
+    let r = pipeline::run(cfg, &mut db::open(&cfg.db_path())?, id, false, true)
         .map_err(|(e, _)| e)?;
     println!("{r}");
     Ok(())

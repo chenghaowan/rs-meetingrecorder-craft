@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowTextW, GetWindowRect, IsIconic, IsWindowVisible,
 };
@@ -119,6 +119,50 @@ pub struct CaptureReceipt {
     pub ocr: Option<serde_json::Value>,
 }
 
+/// UWP 挂起/幽灵窗口标记(DWMWA_CLOAKED);带此属性的窗口截出来是空白
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    hr.is_ok() && cloaked != 0
+}
+
+/// 当前可见顶层窗口标题(去重排序,供设置里"选择运行中的窗口"下拉)。
+/// 过滤:不可见/最小化/幽灵窗口(cloaked)/无标题/过小(工具提示之类)。
+pub fn list_window_titles() -> Vec<String> {
+    struct Ctx {
+        titles: Vec<String>,
+    }
+    let mut ctx = Ctx { titles: Vec::new() };
+    unsafe extern "system" fn on_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut Ctx);
+        if unsafe { IsWindowVisible(hwnd) }.as_bool()
+            && !unsafe { IsIconic(hwnd) }.as_bool()
+            && !is_cloaked(hwnd)
+        {
+            let title = window_title(hwnd);
+            if !title.trim().is_empty() {
+                let mut r = RECT::default();
+                let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+                if (r.right - r.left) > 80 && (r.bottom - r.top) > 60 {
+                    ctx.titles.push(title);
+                }
+            }
+        }
+        BOOL(1)
+    }
+    let _ = unsafe { EnumWindows(Some(on_window), LPARAM(&mut ctx as *mut Ctx as isize)) };
+    ctx.titles.sort();
+    ctx.titles.dedup();
+    ctx.titles
+}
+
 /// 截指定窗口(经 pointtofixcraft 落库);返回其回执。
 pub fn capture_window(pointtofix_exe: &PathBuf, info: &WindowInfo, ocr: bool) -> Result<CaptureReceipt> {
     let mut cmd = std::process::Command::new(pointtofix_exe);
@@ -128,12 +172,67 @@ pub fn capture_window(pointtofix_exe: &PathBuf, info: &WindowInfo, ocr: bool) ->
     if ocr {
         cmd.arg("--ocr");
     }
+    run_capture(cmd, pointtofix_exe)
+}
+
+/// 全虚拟桌面截图(pointtofixcraft `--capture-full`;多屏时包住所有屏),落库。
+pub fn capture_full(pointtofix_exe: &PathBuf, ocr: bool) -> Result<CaptureReceipt> {
+    let mut cmd = std::process::Command::new(pointtofix_exe);
+    cmd.arg("--capture-full").arg("--json");
+    if ocr {
+        cmd.arg("--ocr");
+    }
+    run_capture(cmd, pointtofix_exe)
+}
+
+/// 全虚拟桌面截图直写文件(`--out`:不落 pointtofix 画廊,会议直拍用)
+pub fn capture_full_to_file(pointtofix_exe: &PathBuf, out: &std::path::Path) -> Result<()> {
+    let mut cmd = std::process::Command::new(pointtofix_exe);
+    cmd.arg("--capture-full").arg("--out").arg(out);
+    run_capture_to_file(cmd, pointtofix_exe, out)
+}
+
+/// 指定窗口截图直写文件(`--capture x,y,w,h --out`;会议直拍用)
+pub fn capture_window_to_file(
+    pointtofix_exe: &PathBuf,
+    info: &WindowInfo,
+    out: &std::path::Path,
+) -> Result<()> {
+    let mut cmd = std::process::Command::new(pointtofix_exe);
+    cmd.arg("--capture")
+        .arg(format!("{},{},{},{}", info.x, info.y, info.w, info.h))
+        .arg("--out")
+        .arg(out);
+    run_capture_to_file(cmd, pointtofix_exe, out)
+}
+
+fn run_capture_to_file(
+    mut cmd: std::process::Command,
+    exe: &PathBuf,
+    out: &std::path::Path,
+) -> Result<()> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let status = cmd
+        .status()
+        .with_context(|| format!("启动截图工具失败: {}", exe.display()))?;
+    if !status.success() {
+        bail!("截图失败(退出码 {:?})", status.code());
+    }
+    if !out.is_file() {
+        bail!("截图工具未产出文件: {}", out.display());
+    }
+    Ok(())
+}
+
+fn run_capture(mut cmd: std::process::Command, exe: &PathBuf) -> Result<CaptureReceipt> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let out = cmd
         .output()
-        .with_context(|| format!("启动截图工具失败: {}", pointtofix_exe.display()))?;
+        .with_context(|| format!("启动截图工具失败: {}", exe.display()))?;
     if !out.status.success() {
         bail!("截图失败(退出码 {:?}): {}", out.status.code(), String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or(""));
     }

@@ -37,9 +37,11 @@ fn default_root() -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct Shot {
     pub created_at: i64,
-    /// gallery 根目录下的相对路径('/' 分隔)
+    /// gallery 根目录下的相对路径('/' 分隔);会议直拍时是 data_dir 相对路径
     pub file_rel: String,
     pub ocr_text: String,
+    /// 会议直拍(✂/📷/自动截图)的绝对源路径;画廊来源为 None(用 root.join(file_rel))
+    pub abs_path: Option<PathBuf>,
 }
 
 /// 只读连接(WAL 下安全,不干扰 pointtofixcraft 写入)
@@ -78,7 +80,7 @@ pub fn meeting_shots(conn: &Connection, cfg: &ShotsCfg, from_ms: i64, to_ms: i64
         let (created_at, file_rel, ocr_text) = row?;
         let abs = root.join(file_rel.replace('/', "\\"));
         if abs.exists() {
-            out.push(Shot { created_at, file_rel, ocr_text });
+            out.push(Shot { created_at, file_rel, ocr_text, abs_path: None });
         }
     }
     Ok(out)
@@ -143,6 +145,7 @@ mod tests {
             created_at: 923_000,
             file_rel: "a/b.png".into(),
             ocr_text: String::new(),
+            abs_path: None,
         };
         let links = match_contexts(&[shot], &[seg], 0, 30.0);
         assert_eq!(links[0].image, "img001.png");

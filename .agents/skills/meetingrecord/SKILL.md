@@ -1,24 +1,25 @@
 ---
 name: meetingrecord
-description: 查询/检索本地会议记录(meetings.db + 会议包 JSON),或用无头 CLI 驱动"录音→转写→说话人→LLM总结→会议包→RAG入库"全流程。适用于用户要求"把今天的会议内容找出来"、"上次谁定了××"、"开个会录下来"、"重新总结某场会议"、"查某次会议的行动项"等场景。
+description: 查询/检索本地会议记录(meetings.db + 会议包 JSON/minutes.md),或用无头 CLI 驱动"录音→转写→说话人→LLM总结→会议包"全流程。适用于用户要求"把今天的会议内容找出来"、"上次谁定了××"、"开个会录下来"、"重新总结某场会议"、"查某次会议的行动项"等场景。
 ---
 
 # ltl-meetingrecordCraft 会议记录接入
 
-会议记录器把每场会议的转写、说话人、LLM 总结(decisions/actions/risks)、截图关联存入本地 SQLite 与"会议包"目录,并提供无头 CLI。你可以**直接读库/读包检索**,也可以**调用 CLI 驱动录音与后处理**。两种方式都不需要 MCP——普通 sqlite3 / 子进程即可。
+会议记录器把每场会议的转写、说话人、LLM 总结(decisions/actions/risks)、截图关联存入本地 SQLite 与"会议包"目录(含人类可读的 minutes.md 会议纪要),并提供无头 CLI。你可以**直接读库/读包检索**,也可以**调用 CLI 驱动录音与后处理**。两种方式都不需要 MCP——普通 sqlite3 / 子进程即可。
 
 ## 1. 数据在哪
 
 - 数据库:`%APPDATA%\ltl-meetingrecord\meetings.db`(WAL,可只读并发)
 - 会议包:`%APPDATA%\ltl-meetingrecord\packages\meeting_YYYYMMDD\`
+  - `minutes.md` — 会议纪要(Markdown:总结/决议/行动项/风险 + 转写全文 + 截图引用;人类可读,优先给用户看这个)
   - `transcript.json` — 全量段落(时间戳/说话人/文本)+ chunk 索引
   - `summary.json` — LLM 结构化总结(summary/decisions/actions/risks,条目带 evidence_time)
   - `actions.json` / `decisions.json` — 单独拆出的条目(供任务导入)
   - `screenshots.json` + `screenshots/img001.png…` — 截图与上下文关联
-  - `meta.json` — 元信息
+  - `meta.json` — 元信息(timings.llm 带 provider/model)
 - 录音归档:`%APPDATA%\ltl-meetingrecord\audio\meeting_<id>.wav`
 
-关键表:`meetings`(status: recording/processing/done/failed;audio_remote_path=环回远端 WAV)、`segments`(speaker 列是簇键 SPEAKER_xx,显示名在 `speakers` 表 JOIN;source='mic'|'remote' 区分采集来源)、`speakers`(name/proposed_name/similarity)、`voiceprints`(声纹库,name+centroid BLOB+embedding_model)。
+关键表:`meetings`(status: recording/processing/done/failed;audio_remote_path=环回远端 WAV)、`segments`(speaker 列是簇键:录音中实时标注为 A/B/C…,无 VAD 回退时离线分离为 SPEAKER_xx;显示名在 `speakers` 表 JOIN;source='mic'|'remote' 区分采集来源)、`speakers`(name/proposed_name/similarity/centroid BLOB——实时簇质心,声纹预填用)、`voiceprints`(声纹库,name+centroid BLOB+embedding_model)。
 
 ## 2. CLI(recorder 二进制,双职责)
 
@@ -48,10 +49,10 @@ mrc-recorder --transcribe <wav>
 `mrc-postprocess` 负责后处理:
 ```bash
 mrc-postprocess list                    # 会议列表
-mrc-postprocess run last [--no-llm] [--no-rag] [--non-interactive]
+mrc-postprocess run last [--no-llm] [--non-interactive]
 mrc-postprocess name <id> SPEAKER_00 张三   # 命名(声纹随之注册)
 mrc-postprocess speak <id> SPEAKER_00       # 看某人样例发言(帮对号)
-mrc-postprocess rag <id>                    # 重试 RAG 入库
+mrc-postprocess package <id>                # 只重建会议包(不跑 LLM)
 ```
 
 ## 3. 典型任务
@@ -81,8 +82,9 @@ SELECT text FROM segments WHERE meeting_id=3 AND text LIKE '%偷胶%';
 - 全链路本地化,无外部网关依赖:采集(cpal 麦克风 + wasapi 环回)→ STT(SenseVoice 进程内 ONNX + silero-vad 切句)→ 说话人(pyannote-segmentation + CAM++ ONNX,全 CPU)→ 翻译(llama-server Vulkan + Hy-MT3,可选)
 - 转写唯一引擎 = 本地 SenseVoice(zh/en/ja/ko/yue,自带标点;[stt] 配语言);模型缺失开会自动下载(~230MB,hf-mirror),失败降级只归档
 - 双路采集:现场麦克风(source='mic')与系统环回(source='remote',Teams 等会议软件远端声)并行转写,segments.source 可区分;归档双 WAV(meeting_<id>.wav / meeting_<id>_remote.wav)
-- 字幕实时翻译(`[translate]`):`provider = "local"` 走本机 llama-server + Hy-MT3(GPU,离线,自动拉起 127.0.0.1:17810);`"llm"` 复用 [llm] 端点;`"baidu"` 百度 API。译文在 `segments.translation`/字幕条第二行/transcript.json
-- LLM 总结需 `[llm] api_key`;`--no-llm` 只出转写/截图/骨架包
+- 字幕实时翻译(`[translate]`):源语言自动识别,只配 `to_lang`;`provider = "local"` 走本机 llama-server + Hy-MT3(GPU,离线,自动拉起 127.0.0.1:17810);`"llm"` 复用 [llm] API 端点;`"baidu"` 百度 API。译文在 `segments.translation`/字幕条第二行/transcript.json
+- LLM 总结双模式:`[llm].provider = "api"`(需 api_key)或 `"local"`(llama-server + GGUF,模型在 `data_dir\models\llm`;按独显显存自动分档 ≥11GB→8B / ≥7.5GB→8B@16k / ≥5GB→4B / 核显→1.7B,GUI 设置可一键下载);`--no-llm` 只出转写/截图/骨架包(minutes.md 照常生成,纪要区标"未生成")
 - 说话人分离全本地 ONNX(模型自动下载 34MB);含语言线索纠偏(短应答继承/回合约束/称呼反推);失败自动跳过,名字全靠手动命名;声纹跨会议预填(只比同嵌入模型质心)
 - 会议包重跑幂等(复用同目录覆盖);截图源是 pointtofixcraft 的 gallery.db(只读)
+- 截图全走 pointtofixcraft 无头 CLI:面板 ✂(全屏 `--capture-full`)、📷/自动截图(`--capture x,y,w,h`)在会议中一律加 `--out` **直拍进会议**(data_dir\shots\meeting_<id>\,不写 pointtofix 画廊;散会拷进包内 screenshots/ 并按时间关联);画廊只读用于关联用户自己在 pointtofix 里截的图;便携包在 GitHub/Gitee releases(zip)
 - F8 截图归 pointtofixcraft;本工具热键是 F9

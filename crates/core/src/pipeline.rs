@@ -1,5 +1,6 @@
 //! 后处理流水线总控:diarize → 声纹预填 → 命名(可交互) → chunk → 截图匹配
-//! → LLM 总结(命名之后跑,产物直接带真名) → 会议包 → RAG 入库。
+//! → LLM 总结(命名之后跑,产物直接带真名) → 会议包(transcript/summary JSON
+//! + minutes.md 会议纪要)。
 //!
 //! 每步幂等可重跑;命名缺失且非交互时以 PipelineStop::NamingNeeded 返回,
 //! 由 CLI/托盘提示后继续。
@@ -18,7 +19,6 @@ use crate::diarize;
 use crate::diarize_refine;
 use crate::llm::{self, LlmClient};
 use crate::package::{self, PackageInput};
-use crate::rag::{self, RagClient};
 use crate::shots;
 use crate::tokens::approx_tokens;
 use crate::translate::Translator;
@@ -39,8 +39,7 @@ pub struct Report {
     pub named: usize,
     pub llm_used: bool,
     pub llm_halves: bool,
-    pub rag_ingested: Option<usize>,
-    pub rag_error: Option<String>,
+    pub llm_provider: Option<String>,
     pub elapsed_ms: u64,
 }
 
@@ -58,14 +57,7 @@ impl std::fmt::Display for Report {
             if self.llm_used { "✓" } else { "—" },
             if self.llm_halves { "(两段降级)" } else { "" },
             self.package_dir.as_deref().unwrap_or("(未生成)"),
-        )?;
-        if let Some(n) = self.rag_ingested {
-            write!(f, "\n  RAG 入库: {n} 条")?;
-        }
-        if let Some(e) = &self.rag_error {
-            write!(f, "\n  RAG 入库失败(可 `postprocess rag {}` 重试): {e}", self.meeting_id)?;
-        }
-        Ok(())
+        )
     }
 }
 
@@ -75,7 +67,6 @@ pub fn run(
     meeting_id: i64,
     interactive: bool,
     skip_llm: bool,
-    skip_rag: bool,
 ) -> std::result::Result<Report, (anyhow::Error, Option<PipelineStop>)> {
     let t0 = Instant::now();
     let inner = || -> Result<(Report, Option<PipelineStop>)> {
@@ -86,6 +77,8 @@ pub fn run(
         let mut segs = db::load_segments(conn, meeting_id)?;
 
         // ---- 1. diarization(只在 segments 还没说话人时跑一次;双流 + 跨流合并) ----
+        // 录音中已实时标注(A/B/C)时跳过离线分离,簇质心在停止录音时已写入
+        // speakers.centroid,直接取出供声纹预填/注册(与离线路径同一套逻辑)。
         let mut diar_embeddings: BTreeMap<String, Vec<f32>> = BTreeMap::new();
         let mut diarized = false;
         let has_speaker = segs.iter().any(|s| s.speaker.is_some());
@@ -103,6 +96,18 @@ pub fn run(
                         eprintln!("[pipeline] diarization 跳过: {e}");
                     }
                 }
+            }
+        } else if has_speaker {
+            match db::load_speaker_centroids(conn, meeting_id) {
+                Ok(blobs) if !blobs.is_empty() => {
+                    diar_embeddings = blobs
+                        .into_iter()
+                        .map(|(k, b)| (k, diarize::decode_vec(&b)))
+                        .collect();
+                    diarized = true;
+                    eprintln!("[pipeline] 实时说话人标注 {} 簇,跳过离线分离", diar_embeddings.len());
+                }
+                _ => eprintln!("[pipeline] 已有说话人标注,跳过离线分离(无质心,声纹预填跳过)"),
             }
         }
 
@@ -186,7 +191,7 @@ pub fn run(
                     Report {
                         meeting_id, package_dir: None, segments: segs.len(), chunks: 0,
                         screenshots: 0, diarized, named: named_count, llm_used: false,
-                        llm_halves: false, rag_ingested: None, rag_error: None,
+                        llm_halves: false, llm_provider: None,
                         elapsed_ms: t0.elapsed().as_millis() as u64,
                     },
                     Some(PipelineStop::NamingNeeded(unnamed)),
@@ -238,35 +243,58 @@ pub fn run(
         // ---- 3. chunk ----
         let chunks = chunk::chunk_segments(&segs_named, &cfg.post);
 
-        // ---- 4. 截图匹配 ----
-        let mut links: Vec<shots::ShotLink> = Vec::new();
-        let mut shot_files: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        // ---- 4. 截图匹配(pointtofix 画廊 + 会议直拍两路合并,按时间统一编号) ----
+        let mut all_shots: Vec<shots::Shot> = Vec::new();
         let shot_db = shots::open_readonly(&cfg.shots);
         if let Ok(sconn) = shot_db {
             match shots::meeting_shots(&sconn, &cfg.shots, meeting.started_at, ended_at) {
-                Ok(list) => {
-                    links = shots::match_contexts(&list, &segs_named, meeting.started_at, cfg.shots.context_window_secs);
-                    let root = shots::root(&cfg.shots);
-                    // list 与 links 同序(match_contexts 按 shots 顺序生成)
-                    for (sh, link) in list.iter().zip(&links) {
-                        let src = root.join(sh.file_rel.replace('/', "\\"));
-                        shot_files.push((src, std::path::PathBuf::from(&link.image)));
-                    }
-                }
+                Ok(list) => all_shots.extend(list),
                 Err(e) => eprintln!("[pipeline] 截图读取失败: {e}"),
             }
         } else {
-            eprintln!("[pipeline] 无 gallery.db,跳过截图关联");
+            eprintln!("[pipeline] 无 gallery.db,跳过画廊截图关联");
         }
+        // 会议直拍(✂/📷/自动截图:--out 直存 data_dir\shots,不进画廊)
+        let direct = db::load_meeting_shots(conn, meeting_id)?;
+        for (created, rel) in &direct {
+            let abs = cfg.data_dir().join(rel.replace('/', "\\"));
+            if abs.exists() {
+                all_shots.push(shots::Shot {
+                    created_at: *created,
+                    file_rel: rel.clone(),
+                    ocr_text: String::new(),
+                    abs_path: Some(abs),
+                });
+            }
+        }
+        all_shots.sort_by_key(|s| s.created_at);
+        let links: Vec<shots::ShotLink> =
+            shots::match_contexts(&all_shots, &segs_named, meeting.started_at, cfg.shots.context_window_secs);
+        // all_shots 与 links 同序(match_contexts 按输入顺序生成)
+        let gallery_root = shots::root(&cfg.shots);
+        let shot_files: Vec<(std::path::PathBuf, std::path::PathBuf)> = all_shots
+            .iter()
+            .zip(&links)
+            .map(|(sh, link)| {
+                let src = sh
+                    .abs_path
+                    .clone()
+                    .unwrap_or_else(|| gallery_root.join(sh.file_rel.replace('/', "\\")));
+                (src, std::path::PathBuf::from(&link.image))
+            })
+            .collect();
         let screenshots = links.len();
 
         // ---- 5. LLM 总结(命名后,带截图上下文) ----
         let mut summary: Option<Value> = None;
         let mut llm_meta: Option<Value> = None;
         let mut llm_halves = false;
+        let mut llm_provider: Option<String> = None;
         if !skip_llm && !segs_named.is_empty() {
-            match LlmClient::new(&cfg.llm) {
+            let dd = cfg.data_dir();
+            match LlmClient::new(&cfg.llm, Some(dd.as_path())) {
                 Ok(client) => {
+                    llm_provider = Some(client.provider().to_string());
                     let mut user = build_transcript_text(&segs_named, &chunks);
                     let shot_block = serde_json::to_string_pretty(&links).unwrap_or_default();
                     if !links.is_empty() {
@@ -285,6 +313,7 @@ pub fn run(
                         Ok((v, _)) => {
                             summary = Some(v.clone());
                             llm_meta = Some(json!({
+                                "provider": client.provider(),
                                 "model": cfg.llm.model,
                                 "estimated_input_tokens": est,
                                 "halves": llm_halves,
@@ -309,7 +338,7 @@ pub fn run(
                         Report {
                             meeting_id, package_dir: None, segments: segs_named.len(), chunks: chunks.len(),
                             screenshots, diarized, named: named_count, llm_used: summary.is_some(),
-                            llm_halves, rag_ingested: None, rag_error: None,
+                            llm_halves, llm_provider: llm_provider.clone(),
                             elapsed_ms: t0.elapsed().as_millis() as u64,
                         },
                         None,
@@ -331,31 +360,11 @@ pub fn run(
             links: &links,
             summary: summary.as_ref(),
             llm_meta: llm_meta.as_ref(),
+            embed_images: cfg.shots.embed_minutes_images,
         };
         package::write_all(&inp, &package_dir, &copy_jobs)?;
         let package_str = package_dir.to_string_lossy().to_string();
         db::set_package_dir(conn, meeting_id, &package_str)?;
-
-        // ---- 7. RAG 入库 ----
-        let mut rag_ingested = None;
-        let mut rag_error = None;
-        if !skip_rag {
-            match RagClient::new(&cfg.rag) {
-                Ok(client) => {
-                    let docs = rag::build_docs(meeting_id, &meeting.title, &chunks, summary.as_ref(), &links);
-                    match client.ingest(meeting_id, &meeting.title, &docs) {
-                        Ok(n) => rag_ingested = Some(n),
-                        Err(e) => rag_error = Some(e.to_string()),
-                    }
-                }
-                Err(e) => {
-                    // 未配置不算错误,静默跳过;已配置但连不上才算
-                    if cfg.rag.base_url.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
-                        rag_error = Some(e.to_string());
-                    }
-                }
-            }
-        }
 
         db::set_status(conn, meeting_id, "done")?;
         Ok((
@@ -369,8 +378,7 @@ pub fn run(
                 named: named_count,
                 llm_used: summary.is_some(),
                 llm_halves,
-                rag_ingested,
-                rag_error,
+                llm_provider,
                 elapsed_ms: t0.elapsed().as_millis() as u64,
             },
             None,

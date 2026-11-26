@@ -325,6 +325,8 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
         let mut streaming = Streaming::new(asr.clone(), vad, cfg2.stt.window_secs);
         let mut remote = remote_shared2
             .map(|sh| (sh, Streaming::new(asr.clone(), vad_remote, cfg2.stt.window_secs)));
+        // 实时说话人标注(A/B/C…,mic/remote 共享同一聚类器)
+        let mut live_diar = mrc_core::diarize::LiveDiarizer::from_config(&cfg2).unwrap_or(None);
         let mut idx: i64 = 0;
         let res = (|| -> Result<()> {
             let conn = db::open(&cfg2.db_path())?;
@@ -338,11 +340,15 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
                         let mut new_texts: Vec<String> = Vec::new();
                         let mut new_idx: Vec<i64> = Vec::new();
                         for s in &segs {
-                            db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("mic"), &s.text)?;
+                            let spk = live_diar
+                                .as_mut()
+                                .and_then(|d| (!s.samples.is_empty()).then(|| d.assign(&s.samples)))
+                                .flatten();
+                            db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, spk.as_deref(), Some("mic"), &s.text)?;
                             new_idx.push(idx);
                             new_texts.push(s.text.clone());
                             idx += 1;
-                            eprintln!("[cli] + {}", s.text.chars().take(50).collect::<String>());
+                            eprintln!("[cli] +{} {}", spk.as_deref().map(|k| format!("[{k}]")).unwrap_or_default(), s.text.chars().take(50).collect::<String>());
                         }
                         if let Some(tr) = translator.as_ref() {
                             let outs = tr.translate_batch(&new_texts);
@@ -361,9 +367,13 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
                     match rst.tick(rsh) {
                         mrc_core::transcribe::StreamEvent::Segments(segs) => {
                             for s in &segs {
-                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("remote"), &s.text)?;
+                                let spk = live_diar
+                                    .as_mut()
+                                    .and_then(|d| (!s.samples.is_empty()).then(|| d.assign(&s.samples)))
+                                    .flatten();
+                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, spk.as_deref(), Some("remote"), &s.text)?;
                                 idx += 1;
-                                eprintln!("[cli] +[远端] {}", s.text.chars().take(50).collect::<String>());
+                                eprintln!("[cli] +[远端]{} {}", spk.as_deref().map(|k| format!("[{k}]")).unwrap_or_default(), s.text.chars().take(50).collect::<String>());
                             }
                         }
                         mrc_core::transcribe::StreamEvent::Error(e) => eprintln!("[warn] 远端转写失败(重试): {e}"),
@@ -374,16 +384,31 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
             }
             if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.drain(&shared2) {
                 for s in &segs {
-                    db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("mic"), &s.text)?;
+                    let spk = live_diar
+                        .as_mut()
+                        .and_then(|d| (!s.samples.is_empty()).then(|| d.assign(&s.samples)))
+                        .flatten();
+                    db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, spk.as_deref(), Some("mic"), &s.text)?;
                     idx += 1;
                 }
             }
             if let Some((rsh, rst)) = remote.as_mut() {
                 if let mrc_core::transcribe::StreamEvent::Segments(segs) = rst.drain(rsh) {
                     for s in &segs {
-                        db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("remote"), &s.text)?;
+                        let spk = live_diar
+                            .as_mut()
+                            .and_then(|d| (!s.samples.is_empty()).then(|| d.assign(&s.samples)))
+                            .flatten();
+                        db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, spk.as_deref(), Some("remote"), &s.text)?;
                         idx += 1;
                     }
+                }
+            }
+            // 簇质心入库(会后声纹预填/注册用)
+            if let Some(d) = live_diar.as_ref() {
+                for (k, c) in d.centroids() {
+                    let _ = db::upsert_speaker(&conn, meeting_id, &k, None, None, None);
+                    let _ = db::set_speaker_centroid(&conn, meeting_id, &k, &mrc_core::diarize::encode_vec(&c));
                 }
             }
             Ok(())
@@ -442,7 +467,7 @@ fn cmd_start(cfg: &Config, title: Option<&str>, stop_file: Option<&str>) -> Resu
     )?;
 
     // 后处理(控制台交互命名)
-    let outcome = pipeline::run(cfg, &mut { conn }, meeting_id, true, false, false);
+    let outcome = pipeline::run(cfg, &mut { conn }, meeting_id, true, false);
     let (status, pkg, note) = match outcome {
         Ok(r) => ("done".to_string(), r.package_dir.clone(), None),
         Err((_, Some(PipelineStop::NamingNeeded(keys)))) => (

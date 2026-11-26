@@ -12,8 +12,9 @@ use crate::screen;
 /// 实时链路共享状态(转写线程写,UI/字幕条读)
 #[derive(Default)]
 pub struct Live {
-    /// 最近转写段:(会议相对毫秒, 说话人显示名, 原文, 译文),最多保留 200 条
-    pub segments: Vec<(i64, String, String, String)>,
+    /// 最近转写段:(会议相对毫秒, 说话人键(A/B/C…), 说话人显示名, 原文, 译文),
+    /// 最多保留 200 条。键用于面板点击改名;显示名 = 改名后名字,未命名 = 键。
+    pub segments: Vec<(i64, String, String, String, String)>,
     pub started_at_ms: i64,
     pub error: Option<String>,
 }
@@ -27,11 +28,24 @@ fn chrono_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn push_line(live: &SharedLive, rel_ms: i64, speaker: &str, text: &str, translation: &str) {
+pub fn push_line(
+    live: &SharedLive,
+    rel_ms: i64,
+    speaker_key: &str,
+    speaker_display: &str,
+    text: &str,
+    translation: &str,
+) {
     let mut g = live.lock().expect("live 锁");
-    g.segments.push((rel_ms, speaker.to_string(), text.to_string(), translation.to_string()));
+    g.segments.push((
+        rel_ms,
+        speaker_key.to_string(),
+        speaker_display.to_string(),
+        text.to_string(),
+        translation.to_string(),
+    ));
     if g.segments.len() > 200 {
-            let n = g.segments.len();
+        let n = g.segments.len();
         g.segments.drain(..n - 200);
     }
 }
@@ -50,13 +64,14 @@ pub fn show(
             .rev()
             .take(2)
             .rev()
-            .map(|(_, spk, text, trn)| {
-                let line = if spk.is_empty() {
+            .map(|(_, spk, disp, text, trn)| {
+                let who = if disp.is_empty() { spk } else { disp };
+                let line = if who.is_empty() {
                     text.clone()
                 } else {
-                    format!("{spk}:{text}")
+                    format!("{who}:{text}")
                 };
-                (spk.clone(), line, trn.clone())
+                (who.clone(), line, trn.clone())
             })
             .collect()
     };

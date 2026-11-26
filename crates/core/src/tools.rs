@@ -16,6 +16,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::config::Config;
 
 pub const EXE_NAME: &str = "pointtofix.exe";
+/// 双端发布页(release 资产 pointtofix-craft-portable.zip;解压后把目录填进设置"来源"即可安装)
+pub const RELEASES_GITHUB: &str = "https://github.com/chenghaowan/pointtofixcraft/releases";
+pub const RELEASES_GITEE: &str = "https://gitee.com/chenghao_wan/pointtofixcraft/releases";
 
 pub fn install_dir(cfg: &Config) -> PathBuf {
     cfg.data_dir().join("tools").join("pointtofix")
@@ -56,6 +59,15 @@ fn sibling_dist() -> Option<PathBuf> {
             .join(EXE_NAME);
         if p.is_file() {
             return Some(p);
+        }
+        // 开发机备选:兄弟仓库 cargo build 的产物
+        let dev = root
+            .join("pointtofixcraft")
+            .join("target")
+            .join("release")
+            .join(EXE_NAME);
+        if dev.is_file() {
+            return Some(dev);
         }
     }
     None

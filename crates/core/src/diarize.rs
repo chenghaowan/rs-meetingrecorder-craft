@@ -291,6 +291,109 @@ pub fn merge_into_segments(
     Ok(updated)
 }
 
+// ---------- 实时说话人标注 ----------
+
+/// 录音中逐段标注说话人:每段语音 → CAM++ 嵌入 → 与已有簇质心余弦比对
+/// (阈值同离线 [diarize].threshold),够像归簇(质心增量更新),不像开新簇。
+/// 键 = A/B/C…(首个出现顺序);mic 与 remote 共享同一实例 → 跨流同一人自然归同簇。
+/// 停止时把各簇质心交给调用方写入 speakers.centroid,会后声纹预填/注册照常工作。
+pub struct LiveDiarizer {
+    extractor: sherpa_rs::speaker_id::EmbeddingExtractor,
+    clusters: Vec<LiveCluster>,
+    threshold: f32,
+}
+
+struct LiveCluster {
+    key: String,
+    centroid: Vec<f32>,
+    count: usize,
+}
+
+impl LiveDiarizer {
+    /// diarize.enabled=false 或模型缺失/下载失败 → None(段照常落库,无说话人;
+    /// 会后流水线回退离线分离)
+    pub fn from_config(cfg: &Config) -> Result<Option<Self>> {
+        if !cfg.diarize.enabled {
+            return Ok(None);
+        }
+        let (_seg, emb) = ensure_models(cfg)?;
+        let extractor = sherpa_rs::speaker_id::EmbeddingExtractor::new(
+            sherpa_rs::speaker_id::ExtractorConfig {
+                model: emb.display().to_string(),
+                num_threads: Some(2),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow!("声纹嵌入器加载失败: {e}"))?;
+        Ok(Some(Self { extractor, clusters: Vec::new(), threshold: cfg.diarize.threshold }))
+    }
+
+    /// 一段语音 → 说话人键(A/B/C…)。<0.5s 或嵌入失败返回 None。
+    pub fn assign(&mut self, samples: &[f32]) -> Option<String> {
+        // 上限 30s(嵌入模型按固定窗聚合,足够;VAD 最长 20s 一般不会触顶)
+        let buf: &[f32] = if samples.len() > 30 * 16000 {
+            &samples[..30 * 16000]
+        } else {
+            samples
+        };
+        if buf.len() < 8000 {
+            return None;
+        }
+        let emb = self
+            .extractor
+            .compute_speaker_embedding(buf.to_vec(), 16000)
+            .ok()?;
+        let mut best: Option<(usize, f32)> = None;
+        for (i, c) in self.clusters.iter().enumerate() {
+            let sim = cosine(&emb, &c.centroid);
+            if best.map(|(_, s)| sim > s).unwrap_or(true) {
+                best = Some((i, sim));
+            }
+        }
+        let idx = match best {
+            Some((i, sim)) if sim >= self.threshold => {
+                let c = &mut self.clusters[i];
+                let n = (c.count + 1) as f32;
+                for (v, m) in c.centroid.iter_mut().zip(&emb) {
+                    *v += (m - *v) / n;
+                }
+                c.count += 1;
+                i
+            }
+            _ => {
+                self.clusters.push(LiveCluster {
+                    key: letter_key(self.clusters.len()),
+                    centroid: emb,
+                    count: 1,
+                });
+                self.clusters.len() - 1
+            }
+        };
+        Some(self.clusters[idx].key.clone())
+    }
+
+    /// 各簇质心(key → embedding),供停止时写库
+    pub fn centroids(&self) -> BTreeMap<String, Vec<f32>> {
+        self.clusters
+            .iter()
+            .map(|c| (c.key.clone(), c.centroid.clone()))
+            .collect()
+    }
+}
+
+/// 0→A, 1→B … 25→Z, 26→AA(表格列名式)
+fn letter_key(mut n: usize) -> String {
+    let mut s = String::new();
+    loop {
+        s.insert(0, (b'A' + (n % 26) as u8) as char);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    s
+}
+
 // ---------- 声纹库 ----------
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {

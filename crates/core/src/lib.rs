@@ -1,7 +1,7 @@
 //! mrc-core — 会议记录核心库。
 //!
 //! 分层:实时链路(capture → transcribe → db)与后处理链路
-//! (diarize → naming → chunk → shots → llm → package → rag),
+//! (diarize → naming → chunk → shots → llm → package → minutes.md),
 //! 两链路只通过 meetings.db 交汇;recorder(常驻托盘)与 postprocess(CLI)
 //! 都是薄壳,业务全在这里。
 
@@ -12,10 +12,10 @@ pub mod config;
 pub mod db;
 pub mod diarize;
 pub mod diarize_refine;
+pub mod gpu;
 pub mod llm;
 pub mod package;
 pub mod pipeline;
-pub mod rag;
 pub mod shots;
 pub mod stt;
 pub mod tokens;

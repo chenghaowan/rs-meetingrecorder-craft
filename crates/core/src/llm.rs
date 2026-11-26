@@ -1,17 +1,112 @@
-//! OpenAI 兼容 LLM 客户端(ureq 同步)。
+//! LLM 总结客户端(ureq 同步),双 provider:
+//! - "api":OpenAI 兼容端点(Bearer api_key)
+//! - "local":llama-server + 本地 GGUF(复用 translate_server 的生命周期管理,离线)
 //!
 //! 目标:会后一次性结构化总结。response_format 优先 json_schema,
 //! 端点不支持(json_schema=false 配置)则退化为 json_object+提示词强约束。
 //! 超上下文时由 pipeline 走"两段总结→一次合并"降级,这里只管单次调用。
 
+use std::path::PathBuf;
+
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::config::LlmCfg;
+use crate::config::{Config, LlmCfg, LocalTranslateCfg};
+use crate::translate_server::{self, LocalServer};
+
+/// 8B 档:Qwen3-8B(中文总结质量好,Q4_K_M 约 4.7 GB;官方仓,hf-mirror 国内可达)
+pub const RECOMMENDED_MODEL_FILE: &str = "Qwen3-8B-Q4_K_M.gguf";
+pub const RECOMMENDED_MODEL_URL: &str =
+    "https://hf-mirror.com/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf";
+pub const RECOMMENDED_MODEL_PAGE: &str = "https://hf-mirror.com/Qwen/Qwen3-8B-GGUF";
+/// 4B 档:Qwen3-4B-Instruct-2507(非思考型,Q4_K_M 约 2.3 GB;官方无 GGUF,unsloth 转换)
+pub const SMALL_MODEL_FILE: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+pub const SMALL_MODEL_URL: &str =
+    "https://hf-mirror.com/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+/// 轻量档:Qwen3-1.7B(核显/CPU,Q4_K_M 约 1.0 GB;unsloth)
+pub const TINY_MODEL_FILE: &str = "Qwen3-1.7B-Q4_K_M.gguf";
+pub const TINY_MODEL_URL: &str =
+    "https://hf-mirror.com/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf";
+/// llama-server.exe 预编译包(Vulkan)发布页,与字幕翻译共用同一个包
+pub const LLAMA_CPP_RELEASES: &str = "https://github.com/ggml-org/llama.cpp/releases";
+
+/// 一档推荐(按独显显存分档;ctx 与显存一起给,KV(f16) 按 144KB/token 估算)
+pub struct ModelRec {
+    pub file: &'static str,
+    pub url: &'static str,
+    /// 语言中立的模型名+体积(设置界面直接显示)
+    pub label: &'static str,
+    /// 推荐上下文窗口(写入 [llm.local].ctx,同时是两段降级阈值)
+    pub ctx: u32,
+}
+
+/// 分档:>=11GB→8B@32k | >=7.5GB→8B@16k(8GB 卡:4.7+KV2.3≈7GB)
+///       | >=5GB→4B@16k(6GB 卡:2.3+2.3≈4.6GB) | 其余(核显/4GB 卡)→1.7B@16k(≈2.9GB)
+pub fn recommend_model(dedicated_vram_mb: u64) -> ModelRec {
+    match dedicated_vram_mb {
+        v if v >= 11_000 => ModelRec {
+            file: RECOMMENDED_MODEL_FILE,
+            url: RECOMMENDED_MODEL_URL,
+            label: "Qwen3-8B Q4_K_M · 4.7 GB",
+            ctx: 32768,
+        },
+        v if v >= 7_500 => ModelRec {
+            file: RECOMMENDED_MODEL_FILE,
+            url: RECOMMENDED_MODEL_URL,
+            label: "Qwen3-8B Q4_K_M · 4.7 GB",
+            ctx: 16384,
+        },
+        v if v >= 5_000 => ModelRec {
+            file: SMALL_MODEL_FILE,
+            url: SMALL_MODEL_URL,
+            label: "Qwen3-4B-Instruct-2507 · 2.3 GB",
+            ctx: 16384,
+        },
+        _ => ModelRec {
+            file: TINY_MODEL_FILE,
+            url: TINY_MODEL_URL,
+            label: "Qwen3-1.7B · 1.0 GB",
+            ctx: 16384,
+        },
+    }
+}
+
+/// 本机推荐:按 DXGI 独显显存分档(无独显 → 轻量档)
+pub fn recommend_for_machine() -> ModelRec {
+    let vram = crate::gpu::discrete().map(|g| g.dedicated_mb).unwrap_or(0);
+    recommend_model(vram)
+}
+
+/// 本地总结模型目录(data_dir\models\llm)
+pub fn models_dir(cfg: &Config) -> PathBuf {
+    cfg.data_dir().join("models").join("llm")
+}
+
+/// 下载指定档位模型到 data_dir\models\llm\(可重复执行,已存在跳过)
+pub fn download_model_file(file: &str, url: &str, cfg: &Config) -> Result<PathBuf> {
+    let dir = models_dir(cfg);
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(file);
+    if dest.is_file() && dest.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        return Ok(dest);
+    }
+    crate::stt::download(url, &dest)?;
+    Ok(dest)
+}
+
+/// 下载本机推荐模型(设置"下载推荐模型"与外部调用入口)
+pub fn install_model(cfg: &Config) -> Result<PathBuf> {
+    let rec = recommend_for_machine();
+    download_model_file(rec.file, rec.url, cfg)
+}
 
 pub struct LlmClient {
     cfg: LlmCfg,
+    /// 实际请求端点:api=cfg.base_url;local=http://127.0.0.1:{port}
+    base: String,
+    /// local provider 的服务进程句柄(drop 即 kill 自启进程;复用外部实例 None)
+    _server: Option<LocalServer>,
     agent: ureq::Agent,
 }
 
@@ -37,18 +132,42 @@ struct ChatMsg {
 }
 
 impl LlmClient {
-    pub fn new(cfg: &LlmCfg) -> Result<Self> {
-        if cfg.api_key.is_empty() {
-            bail!("LLM 未配置: 请在 config.toml [llm] 填 api_key");
-        }
+    /// provider="local" 时拉起 llama-server(失败报错);provider="api" 要求 api_key
+    pub fn new(cfg: &LlmCfg, data_dir: Option<&std::path::Path>) -> Result<Self> {
+        let prov = cfg.provider.trim();
+        let (base, server) = match prov {
+            "local" => {
+                let tl = LocalTranslateCfg {
+                    server_exe: cfg.local.server_exe.clone(),
+                    model_path: cfg.local.model_path.clone(),
+                    port: cfg.local.port,
+                    ngl: cfg.local.ngl,
+                    ctx: cfg.local.ctx,
+                };
+                let server = translate_server::ensure(&tl, data_dir)?;
+                (server.base_url.clone(), Some(server))
+            }
+            "" | "api" => {
+                if cfg.api_key.is_empty() {
+                    bail!("LLM 未配置: 请在 config.toml [llm] 填 api_key,或 provider=\"local\" 用本地模型");
+                }
+                (cfg.base_url.clone(), None)
+            }
+            other => bail!("未知 LLM provider: {other}(api/local)"),
+        };
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs))
             .build();
-        Ok(Self { cfg: cfg.clone(), agent })
+        Ok(Self { cfg: cfg.clone(), base, _server: server, agent })
     }
 
     pub fn cfg(&self) -> &LlmCfg {
         &self.cfg
+    }
+
+    /// llm_meta 用:实际生效的 provider
+    pub fn provider(&self) -> &'static str {
+        if self._server.is_some() { "local" } else { "api" }
     }
 
     /// 发一次 chat 请求并要求返回 JSON 对象(已做 ``` 剥壳)。
@@ -58,7 +177,7 @@ impl LlmClient {
         user: &str,
         schema: Option<&Value>,
     ) -> Result<Value> {
-        let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
+        let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
 
         let mut response_format = if self.cfg.json_schema {
             schema.map(|s| {
@@ -77,7 +196,8 @@ impl LlmClient {
         let mut last_err: Option<String> = None;
 
         for attempt in 0..=self.cfg.max_retries {
-            let body = json!({
+            // 本地 Qwen3 是思考型模型:关掉思考,总结直接出 JSON(模板不认识该参数时被忽略)
+            let mut body = json!({
                 "model": self.cfg.model,
                 "temperature": self.cfg.temperature,
                 "messages": [
@@ -86,12 +206,15 @@ impl LlmClient {
                 ],
                 "response_format": response_format,
             });
+            if self._server.is_some() {
+                body["chat_template_kwargs"] = json!({ "enable_thinking": false });
+            }
 
-            let resp = self
-                .agent
-                .post(&url)
-                .set("Authorization", &format!("Bearer {}", self.cfg.api_key))
-                .send_json(&body);
+            let mut req = self.agent.post(&url);
+            if !self.cfg.api_key.is_empty() {
+                req = req.set("Authorization", &format!("Bearer {}", self.cfg.api_key));
+            }
+            let resp = req.send_json(&body);
 
             match resp {
                 Ok(r) => {
@@ -247,5 +370,18 @@ mod tests {
         assert_eq!(v["a"], 1);
         let v = extract_json("前缀 {\"b\":{\"c\":2}} 后缀").unwrap();
         assert_eq!(v["b"]["c"], 2);
+    }
+
+    #[test]
+    fn recommend_tiers_by_vram() {
+        // 核显/无独显/4GB 卡 → 1.7B;6GB 独显 → 4B;8GB → 8B@16k;12GB → 8B@32k
+        let tier = |mb| recommend_model(mb);
+        assert_eq!(tier(0).file, TINY_MODEL_FILE);
+        assert_eq!(tier(4096).file, TINY_MODEL_FILE);
+        assert_eq!(tier(6144).file, SMALL_MODEL_FILE);
+        assert_eq!(tier(8192).file, RECOMMENDED_MODEL_FILE);
+        assert_eq!(tier(8192).ctx, 16384);
+        assert_eq!(tier(12288).file, RECOMMENDED_MODEL_FILE);
+        assert_eq!(tier(12288).ctx, 32768);
     }
 }

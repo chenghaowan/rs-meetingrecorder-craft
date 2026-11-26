@@ -20,6 +20,8 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 # 本地 STT:SenseVoice(sherpa-onnx;download-binaries 自动取预编译二进制)
@@ -27,3 +29,6 @@ sherpa-rs = { version = "0.6.8", default-features = false, features = ["download
 
 # WASAPI 环回采集(Teams 等会议软件的远端声音走系统输出,环回抓取)
 wasapi = "0.27"
+
+# 会议纪要 minutes.md 里内嵌截图(png 解码 → 缩图 → webp → base64)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

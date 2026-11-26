@@ -12,12 +12,20 @@ use anyhow::{bail, Context, Result};
 use crate::capture::TARGET_RATE;
 use crate::stt::LocalAsr;
 
-/// 已落库确定的转写段(会议相对毫秒)
+/// 已落库确定的转写段(会议相对毫秒)。
+/// samples = 该段音频(16k mono,VAD 模式才有;实时说话人聚类用)。
 #[derive(Debug, Clone)]
 pub struct RawSegment {
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
+    pub samples: Vec<f32>,
+}
+
+impl RawSegment {
+    pub fn new(start_ms: i64, end_ms: i64, text: String) -> Self {
+        Self { start_ms, end_ms, text, samples: Vec::new() }
+    }
 }
 
 /// 读取任意 WAV,重采样为 16k mono f32(离线转写用)。
@@ -90,7 +98,9 @@ pub fn transcribe_offline(
                     if s.text.trim().is_empty() {
                         continue;
                     }
-                    out.push(RawSegment { start_ms, end_ms, text: s.text });
+                    let mut r = RawSegment::new(start_ms, end_ms, s.text);
+                    r.samples = seg.clone();
+                    out.push(r);
                 }
             }
         }
@@ -99,7 +109,7 @@ pub fn transcribe_offline(
                 if s.text.trim().is_empty() {
                     continue;
                 }
-                out.push(RawSegment { start_ms: s.start_ms, end_ms: s.end_ms, text: s.text });
+                out.push(RawSegment::new(s.start_ms, s.end_ms, s.text));
             }
         }
     }
@@ -143,11 +153,7 @@ impl Streaming {
         let segs = asr.transcribe(TARGET_RATE, buf)?;
         Ok(segs
             .into_iter()
-            .map(|r| RawSegment {
-                start_ms: buf_start_ms + r.start_ms,
-                end_ms: buf_start_ms + r.end_ms,
-                text: r.text,
-            })
+            .map(|r| RawSegment::new(buf_start_ms + r.start_ms, buf_start_ms + r.end_ms, r.text))
             .collect())
     }
 
@@ -202,7 +208,9 @@ impl Streaming {
                         if s.text.trim().is_empty() {
                             continue;
                         }
-                        out.push(RawSegment { start_ms, end_ms, text: s.text });
+                        let mut r = RawSegment::new(start_ms, end_ms, s.text);
+                        r.samples = samples.clone();
+                        out.push(r);
                     }
                 }
                 Err(e) => eprintln!("[transcribe] 段识别失败({start_ms}~{end_ms}ms,丢弃): {e}"),

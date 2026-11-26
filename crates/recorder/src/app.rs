@@ -38,10 +38,14 @@ pub fn load_icon() -> egui::IconData {
     }
 }
 
-pub const BASE_SIZE: [f32; 2] = [132.0, 96.0]; // 同 pointtofixcraft 待机工具条
+pub const BASE_SIZE: [f32; 2] = [132.0, 114.0]; // 同 pointtofixcraft 待机工具条,底部多一条版本行
+/// 当前版本号(Cargo.toml 的 version;面板底部版本行共用,同 pointtofixcraft)
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TRANS_SIZE: [f32; 2] = [360.0, 470.0];
 // 设置/命名窗必须是独立原生视口:egui::Window 画在 132×96 的主视口里会被裁成小块且拖不动
 const SETTINGS_SIZE: [f32; 2] = [470.0, 640.0];
+/// 设置窗可拖拽缩小的下限(再小会裁掉底部按钮)
+const SETTINGS_MIN_SIZE: [f32; 2] = [430.0, 420.0];
 const NAMING_SIZE: [f32; 2] = [440.0, 600.0];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -87,6 +91,11 @@ pub struct App {
     show_naming: bool,
     draft: Option<Draft>,
     naming: Option<NamingPanel>,
+    /// 实时列表里正在改名的说话人键(A/B/C…);Some = 展开视图顶部显示改名输入框
+    renaming: Option<String>,
+    rename_input: String,
+    /// 可见窗口标题快照(设置打开时取一次;截图窗口下拉用)
+    windows_cache: Option<Vec<String>>,
     notice: Option<(bool, String)>, // (是否错误, 文本)
     report_text: Option<String>,
     package_dir: Option<String>,
@@ -94,6 +103,9 @@ pub struct App {
     quitting: bool,
     tray: Option<crate::tray::Tray>,
     pf_job: Option<ToolJob>,
+    llm_job: Option<DownloadJob>,
+    /// 独显(名称, 独显显存 MB):启动时 DXGI 探测一次,给本地 LLM 推荐做依据
+    gpu_summary: Option<(String, u64)>,
     lang: Lang,
 }
 
@@ -132,6 +144,32 @@ impl ToolJob {
     }
 }
 
+/// 后台模型下载任务(本地 LLM GGUF),完成即由 update 取走并提示
+struct DownloadJob {
+    rx: mpsc::Receiver<std::result::Result<std::path::PathBuf, String>>,
+    status: ToolStatus,
+}
+
+impl DownloadJob {
+    fn start(f: impl FnOnce() -> std::result::Result<std::path::PathBuf, String> + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        Self { rx, status: ToolStatus::Running }
+    }
+    fn poll(&mut self) {
+        if matches!(self.status, ToolStatus::Running) {
+            if let Ok(res) = self.rx.try_recv() {
+                self.status = match res {
+                    Ok(p) => ToolStatus::Ok(p),
+                    Err(e) => ToolStatus::Err(e),
+                };
+            }
+        }
+    }
+}
+
 // ---------- 设置草稿(全 String 便于编辑) ----------
 
 #[derive(Default)]
@@ -139,11 +177,14 @@ struct Draft {
     stt_lang: String,
     stt_window: String,
     diarize_enabled: bool,
+    llm_provider: String,
     llm_base: String,
     llm_key: String,
     llm_model: String,
     llm_schema: bool,
     llm_ctx: String,
+    llm_local_model: String,
+    llm_local_ctx: String,
     main_on_top: bool,
     sub_enabled: bool,
     sub_on_top: bool,
@@ -151,13 +192,11 @@ struct Draft {
     sub_opacity: String,
     sub_margin: String,
     shots_window: String,
-    rag_base: String,
     chunk_window: String,
     chunk_tokens: String,
     pf_url: String,
     lang_code: String,
     tr_provider: String,
-    tr_from: String,
     tr_to: String,
     tr_appid: String,
     tr_secret: String,
@@ -171,11 +210,20 @@ impl Draft {
             stt_lang: c.stt.language.clone(),
             stt_window: c.stt.window_secs.to_string(),
             diarize_enabled: c.diarize.enabled,
+            llm_provider: c.llm.provider.clone(),
             llm_base: c.llm.base_url.clone(),
             llm_key: c.llm.api_key.clone(),
             llm_model: c.llm.model.clone(),
             llm_schema: c.llm.json_schema,
             llm_ctx: c.llm.context_tokens.to_string(),
+            llm_local_model: c
+                .llm
+                .local
+                .model_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            llm_local_ctx: c.llm.local.ctx.to_string(),
             main_on_top: c.main_on_top,
             sub_enabled: c.subtitle.enabled,
             sub_on_top: c.subtitle.always_on_top,
@@ -183,13 +231,11 @@ impl Draft {
             sub_opacity: c.subtitle.opacity.to_string(),
             sub_margin: c.subtitle.bottom_margin.to_string(),
             shots_window: c.shots.context_window_secs.to_string(),
-            rag_base: c.rag.base_url.clone().unwrap_or_default(),
             chunk_window: c.post.chunk_window_secs.to_string(),
             chunk_tokens: c.post.chunk_token_limit.to_string(),
             pf_url: c.tools.pointtofix_url.clone().unwrap_or_default(),
             lang_code: c.lang.clone().unwrap_or_default(),
             tr_provider: c.translate.provider.clone(),
-            tr_from: c.translate.from_lang.clone(),
             tr_to: c.translate.to_lang.clone(),
             tr_appid: c.translate.appid.clone(),
             tr_secret: c.translate.secret.clone(),
@@ -207,11 +253,24 @@ impl Draft {
         c.stt.language = if self.stt_lang.trim().is_empty() { "zh".into() } else { self.stt_lang.trim().into() };
         c.stt.window_secs = self.parse(&self.stt_window, c.stt.window_secs).max(4.0);
         c.diarize.enabled = self.diarize_enabled;
+        c.llm.provider = match self.llm_provider.trim() {
+            "local" => "local".to_string(),
+            _ => "api".to_string(),
+        };
         c.llm.base_url = self.llm_base.trim().to_string();
         c.llm.api_key = self.llm_key.trim().to_string();
         c.llm.model = if self.llm_model.trim().is_empty() { c.llm.model.clone() } else { self.llm_model.trim().into() };
         c.llm.json_schema = self.llm_schema;
         c.llm.context_tokens = self.parse(&self.llm_ctx, c.llm.context_tokens).max(4096);
+        // 本地模式:上下文窗口与两段式降级阈值同步(转写超 0.8×ctx 自动切两半)
+        if c.llm.provider == "local" {
+            let model = self.llm_local_model.trim();
+            c.llm.local.model_path = (!model.is_empty()).then(|| std::path::PathBuf::from(model));
+            c.llm.local.ctx = self.parse(&self.llm_local_ctx, c.llm.local.ctx).clamp(8192, 131072);
+            c.llm.context_tokens = c.llm.local.ctx as usize;
+        } else {
+            c.llm.local.model_path = None;
+        }
         c.main_on_top = self.main_on_top;
         c.subtitle.enabled = self.sub_enabled;
         c.subtitle.always_on_top = self.sub_on_top;
@@ -219,7 +278,6 @@ impl Draft {
         c.subtitle.opacity = self.parse(&self.sub_opacity, c.subtitle.opacity).clamp(0.1, 1.0);
         c.subtitle.bottom_margin = self.parse(&self.sub_margin, c.subtitle.bottom_margin).clamp(0.0, 400.0);
         c.shots.context_window_secs = self.parse(&self.shots_window, c.shots.context_window_secs).clamp(5.0, 300.0);
-        c.rag.base_url = Some(self.rag_base.trim().to_string()).filter(|s| !s.is_empty());
         c.post.chunk_window_secs = self.parse(&self.chunk_window, c.post.chunk_window_secs).clamp(30.0, 1800.0);
         c.post.chunk_token_limit = self.parse(&self.chunk_tokens, c.post.chunk_token_limit).clamp(200, 100000);
         c.tools.pointtofix_url = Some(self.pf_url.trim().to_string()).filter(|s| !s.is_empty());
@@ -229,7 +287,8 @@ impl Draft {
             "local" | "llm" | "baidu" => prov.to_string(),
             _ => "none".to_string(),
         };
-        c.translate.from_lang = if self.tr_from.trim().is_empty() { "zh".into() } else { self.tr_from.trim().into() };
+        // 源语言一律自动识别(MT3 模板/LLM 提示词/百度 from=auto 都不需要源语言)
+        c.translate.from_lang = "auto".into();
         c.translate.to_lang = if self.tr_to.trim().is_empty() { "en".into() } else { self.tr_to.trim().into() };
         c.translate.appid = self.tr_appid.trim().to_string();
         c.translate.secret = self.tr_secret.trim().to_string();
@@ -313,6 +372,9 @@ impl App {
             show_naming: false,
             draft: None,
             naming: None,
+            renaming: None,
+            rename_input: String::new(),
+            windows_cache: None,
             notice: Some((false, lang.strings().hint_start.into())),
             report_text: None,
             package_dir: None,
@@ -320,6 +382,8 @@ impl App {
             quitting: false,
             tray,
             pf_job: None,
+            llm_job: None,
+            gpu_summary: mrc_core::gpu::discrete().map(|g| (g.name, g.dedicated_mb)),
             lang,
         }
     }
@@ -405,6 +469,8 @@ impl App {
             let mut streaming = Streaming::new(asr.clone(), vad, cfg2.stt.window_secs);
             let mut remote = remote_shared2
                 .map(|sh| (sh, Streaming::new(asr.clone(), vad_remote, cfg2.stt.window_secs)));
+            // 实时说话人标注(逐段 CAM++ 声纹聚类 → A/B/C…;mic/remote 共享同一聚类器)
+            let mut live_diar = mrc_core::diarize::LiveDiarizer::from_config(&cfg2).unwrap_or(None);
             let mut idx: i64 = 0;
             let res = (|| -> Result<()> {
                 let conn = db::open(&cfg2.db_path())?;
@@ -419,12 +485,26 @@ impl App {
                             let mut new_idx: Vec<i64> = Vec::new();
                             let mut new_start: Vec<i64> = Vec::new();
                             for s in &segs {
-                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("mic"), &s.text)?;
+                                let spk = live_diar
+                                    .as_mut()
+                                    .and_then(|d| (!s.samples.is_empty()).then(|| d.assign(&s.samples)))
+                                    .flatten();
+                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, spk.as_deref(), Some("mic"), &s.text)?;
                                 new_idx.push(idx);
                                 new_texts.push(s.text.clone());
                                 new_start.push(s.start_ms);
                                 idx += 1;
-                                subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
+                                let disp = spk
+                                    .as_deref()
+                                    .and_then(|k| db::load_speaker_names(&conn, meeting_id).ok()?.get(k).cloned());
+                                subtitle::push_line(
+                                    &live2,
+                                    s.start_ms,
+                                    spk.as_deref().unwrap_or(""),
+                                    disp.as_deref().unwrap_or_else(|| spk.as_deref().unwrap_or("")),
+                                    &s.text,
+                                    "",
+                                );
                             }
                             // 实时翻译(未启用/失败静默,原文照常)
                             if let Some(tr) = translator.as_ref() {
@@ -433,8 +513,8 @@ impl App {
                                     if let Some(v) = o {
                                         let _ = db::update_translation(&conn, new_idx[k], meeting_id, v);
                                         if let Ok(mut g) = live2.lock() {
-                                            if let Some(e) = g.segments.iter_mut().rev().find(|e| e.0 == new_start[k] && e.3.is_empty()) {
-                                                e.3 = v.clone();
+                                            if let Some(e) = g.segments.iter_mut().rev().find(|e| e.0 == new_start[k] && e.4.is_empty()) {
+                                                e.4 = v.clone();
                                             }
                                         }
                                     }
@@ -452,18 +532,32 @@ impl App {
                     if let Some((rsh, rst)) = remote.as_mut() {
                         if let mrc_core::transcribe::StreamEvent::Segments(segs) = rst.tick(rsh) {
                             for s in &segs {
-                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("remote"), &s.text)?;
+                                let spk = live_diar
+                                    .as_mut()
+                                    .and_then(|d| (!s.samples.is_empty()).then(|| d.assign(&s.samples)))
+                                    .flatten();
+                                db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, spk.as_deref(), Some("remote"), &s.text)?;
                                 idx += 1;
-                                subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
+                                let disp = spk
+                                    .as_deref()
+                                    .and_then(|k| db::load_speaker_names(&conn, meeting_id).ok()?.get(k).cloned());
+                                subtitle::push_line(
+                                    &live2,
+                                    s.start_ms,
+                                    spk.as_deref().unwrap_or(""),
+                                    disp.as_deref().unwrap_or_else(|| spk.as_deref().unwrap_or("")),
+                                    &s.text,
+                                    "",
+                                );
                             }
                         }
                     }
-                    // 自动窗口截图(失败静默,只打印一次)
+                    // 自动窗口截图(会议直拍;失败静默,只打印一次)
                     if auto_shots && last_shot.elapsed() >= shot_every {
                         last_shot = std::time::Instant::now();
                         if let (Some(exe), Ok(info)) = (pf_exe.as_ref(), windowcap::find_window(&cfg2.shots.default_window)) {
-                            match windowcap::capture_window(exe, &info, false) {
-                                Ok(r) => eprintln!("[shots] 窗口截图 #{} {}x{}", r.id.unwrap_or(0), info.w, info.h),
+                            match shot_into_meeting(&cfg2, meeting_id, exe, Some(&info)) {
+                                Ok(name) => eprintln!("[shots] 会议直拍 {name}"),
                                 Err(e) => eprintln!("[shots] 自动截图失败: {e:#}"),
                             }
                         }
@@ -473,18 +567,36 @@ impl App {
                 // 收尾残余(双路 VAD 冲刷尾部语音)
                 if let mrc_core::transcribe::StreamEvent::Segments(segs) = streaming.drain(&shared2) {
                     for s in &segs {
-                        db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("mic"), &s.text)?;
-                        subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
+                        let spk = live_diar
+                            .as_mut()
+                            .and_then(|d| (!s.samples.is_empty()).then(|| d.assign(&s.samples)))
+                            .flatten();
+                        db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, spk.as_deref(), Some("mic"), &s.text)?;
+                        subtitle::push_line(&live2, s.start_ms, spk.as_deref().unwrap_or(""), spk.as_deref().unwrap_or(""), &s.text, "");
                         idx += 1;
                     }
                 }
                 if let Some((rsh, rst)) = remote.as_mut() {
                     if let mrc_core::transcribe::StreamEvent::Segments(segs) = rst.drain(rsh) {
                         for s in &segs {
-                            db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, None, Some("remote"), &s.text)?;
-                            subtitle::push_line(&live2, s.start_ms, "", &s.text, "");
+                            let spk = live_diar
+                                .as_mut()
+                                .and_then(|d| (!s.samples.is_empty()).then(|| d.assign(&s.samples)))
+                                .flatten();
+                            db::insert_segment(&conn, meeting_id, idx, s.start_ms, s.end_ms, spk.as_deref(), Some("remote"), &s.text)?;
+                            subtitle::push_line(&live2, s.start_ms, spk.as_deref().unwrap_or(""), spk.as_deref().unwrap_or(""), &s.text, "");
                             idx += 1;
                         }
+                    }
+                }
+                // 簇质心入库(speakers.centroid):会后声纹预填/注册用
+                if let Some(d) = live_diar.as_ref() {
+                    for (k, c) in d.centroids() {
+                        let _ = db::upsert_speaker(&conn, meeting_id, &k, None, None, None);
+                        let _ = db::set_speaker_centroid(&conn, meeting_id, &k, &mrc_core::diarize::encode_vec(&c));
+                    }
+                    if !d.centroids().is_empty() {
+                        eprintln!("[live-diar] {} 簇质心已入库", d.centroids().len());
                     }
                 }
                 Ok(())
@@ -541,7 +653,7 @@ impl App {
                 let mut conn = db::open(&cfg.db_path()).map_err(|e| WorkerFail::Fatal(e.to_string()))?;
                 db::finish_meeting(&conn, s.meeting_id, ended, &format!("audio\\meeting_{}.wav", s.meeting_id), remote_rel.as_deref())
                     .map_err(|e| WorkerFail::Fatal(e.to_string()))?;
-                match pipeline::run(&cfg, &mut conn, s.meeting_id, false, false, false) {
+                match pipeline::run(&cfg, &mut conn, s.meeting_id, false, false) {
                     Ok(r) => Ok((format!("{r}"), r.package_dir.clone())),
                     Err((_, Some(PipelineStop::NamingNeeded(keys)))) => Err(WorkerFail::NeedNaming(keys)),
                     Err((e, None)) => Err(WorkerFail::Fatal(format!("{e:#}"))),
@@ -554,7 +666,59 @@ impl App {
         });
     }
 
-    /// 手动截指定窗口(默认窗口标题取配置;后台线程,不卡 UI)
+    /// ✂ 一键截图:配置了窗口关键词(如 Teams)就只截该窗口,找不到回退全屏;
+    /// 直拍进当前会议(`--out` 写 data_dir\shots\meeting_<id>\,不落 pointtofix
+    /// 画廊;散会拷贝进会议包并按时间关联)。仅录音中可用。
+    fn shot_full_now(&mut self) {
+        let Some(s) = self.session.as_ref() else {
+            self.notice = Some((true, self.lang.strings().hint_shot_need_meeting.into()));
+            return;
+        };
+        let cfg = self.cfg.clone();
+        let meeting_id = s.meeting_id;
+        let tr = self.lang.strings();
+        let Some(_exe) = mrc_core::tools::resolve_available(&cfg) else {
+            self.notice = Some((true, tr.pf_missing.into()));
+            return;
+        };
+        let tx = self.worker_tx.clone();
+        let tr_done = self.lang.strings().hint_shot_ok;
+        let tr_fail = self.lang.strings().hint_shot_fail;
+        let tr_full = self.lang.strings().tr_shot_fullscreen;
+        std::thread::spawn(move || {
+            let outcome = (|| -> anyhow::Result<String> {
+                let exe = mrc_core::tools::resolve_available(&cfg)
+                    .ok_or_else(|| anyhow::anyhow!("pointtofixcraft 未安装"))?;
+                // 配置了窗口关键词就只截该窗口(✂ 与 📷/自动截图同一目标)
+                let kw = cfg.shots.default_window.trim();
+                let target = if kw.is_empty() {
+                    None
+                } else {
+                    windowcap::find_window(kw).ok()
+                };
+                let size = match &target {
+                    Some(info) => format!(
+                        "{}x{} {}",
+                        info.w,
+                        info.h,
+                        info.title.chars().take(24).collect::<String>()
+                    ),
+                    None => tr_full.to_string(),
+                };
+                shot_into_meeting(&cfg, meeting_id, &exe, target.as_ref())?;
+                Ok(size)
+            })();
+            let _ = tx.send(WorkerMsg::Pipeline {
+                meeting_id: -1,
+                outcome: match outcome {
+                    Ok(msg) => Ok((i18n::fill(tr_done, &[&msg]), None)),
+                    Err(e) => Err(WorkerFail::Fatal(format!("{}: {e:#}", tr_fail))),
+                },
+            });
+        });
+    }
+
+    /// 手动截指定窗口(默认窗口标题取配置;直拍进当前会议;后台线程,不卡 UI)
     fn shot_window_now(&mut self) {
         let cfg = self.cfg.clone();
         let kw = cfg.shots.default_window.trim().to_string();
@@ -562,6 +726,11 @@ impl App {
             self.notice = Some((true, self.lang.strings().hint_shot_no_window.into()));
             return;
         }
+        let Some(s) = self.session.as_ref() else {
+            self.notice = Some((true, self.lang.strings().hint_shot_need_meeting.into()));
+            return;
+        };
+        let meeting_id = s.meeting_id;
         let tx = self.worker_tx.clone();
         let tr_done = self.lang.strings().hint_shot_ok;
         let tr_fail = self.lang.strings().hint_shot_fail;
@@ -570,8 +739,9 @@ impl App {
                 let exe = tools::resolve_available(&cfg)
                     .ok_or_else(|| anyhow::anyhow!("pointtofixcraft 未安装"))?;
                 let info = windowcap::find_window(&kw)?;
-                let r = windowcap::capture_window(&exe, &info, false)?;
-                Ok(format!("#{} ({}x{})", r.id.unwrap_or(0), info.w, info.h))
+                let size = format!("{}x{}", info.w, info.h);
+                shot_into_meeting(&cfg, meeting_id, &exe, Some(&info))?;
+                Ok(size)
             })();
             let _ = tx.send(WorkerMsg::Pipeline {
                 meeting_id: -1,
@@ -602,13 +772,22 @@ impl App {
             Err(e) => self.notice = Some((true, i18n::fill(self.lang.strings().err_naming_load, &[&format!("{e:#}")]))),
         }
     }
+
+    /// 打开设置:草稿 + 可见窗口标题快照(截图窗口下拉用)
+    fn open_settings(&mut self) {
+        if self.draft.is_none() {
+            self.draft = Some(Draft::from_cfg(&self.cfg));
+            self.windows_cache = Some(mrc_core::windowcap::list_window_titles());
+        }
+        self.show_settings = !self.show_settings;
+    }
 }
 
 fn spawn_pipeline(tx: mpsc::Sender<WorkerMsg>, cfg: Config, meeting_id: i64) {
     std::thread::spawn(move || {
         let outcome = (|| -> std::result::Result<pipeline::Report, (anyhow::Error, Option<PipelineStop>)> {
             match db::open(&cfg.db_path()) {
-                Ok(mut conn) => pipeline::run(&cfg, &mut conn, meeting_id, false, false, false),
+                Ok(mut conn) => pipeline::run(&cfg, &mut conn, meeting_id, false, false),
                 Err(e) => Err((e, None)),
             }
         })();
@@ -630,6 +809,29 @@ fn spawn_pipeline(tx: mpsc::Sender<WorkerMsg>, cfg: Config, meeting_id: i64) {
     });
 }
 
+/// 会议直拍:pointtofixcraft `--out` 写 data_dir\shots\meeting_<id>\ 并登记
+/// meeting_shots 表(不落 pointtofix 画廊;散会流水线拷贝进会议包 screenshots/
+/// 并按时间关联上下文)。win=None 全虚拟桌面,Some 截指定窗口。返回文件名。
+fn shot_into_meeting(
+    cfg: &Config,
+    meeting_id: i64,
+    exe: &std::path::PathBuf,
+    win: Option<&windowcap::WindowInfo>,
+) -> anyhow::Result<String> {
+    let dir = cfg.data_dir().join("shots").join(format!("meeting_{meeting_id}"));
+    std::fs::create_dir_all(&dir)?;
+    let name = format!("shot_{}.png", chrono_now_ms());
+    let out = dir.join(&name);
+    match win {
+        Some(info) => windowcap::capture_window_to_file(exe, info, &out)?,
+        None => windowcap::capture_full_to_file(exe, &out)?,
+    }
+    let rel = format!("shots\\meeting_{meeting_id}\\{name}");
+    let conn = db::open(&cfg.db_path())?;
+    db::insert_meeting_shot(&conn, meeting_id, chrono_now_ms(), &rel)?;
+    Ok(name)
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ---- 事件源:托盘 / 热键 / 工作线程 ----
@@ -637,12 +839,7 @@ impl eframe::App for App {
             for ev in t.drain() {
                 match ev {
                     TrayEvent::Toggle => self.toggle_meeting(),
-                    TrayEvent::Settings => {
-                        if self.draft.is_none() {
-                            self.draft = Some(Draft::from_cfg(&self.cfg));
-                        }
-                        self.show_settings = !self.show_settings;
-                    }
+                    TrayEvent::Settings => self.open_settings(),
                     TrayEvent::ToggleSubtitle => self.cfg.subtitle.enabled = !self.cfg.subtitle.enabled,
                     TrayEvent::Exit => self.quit(),
                 }
@@ -658,6 +855,30 @@ impl eframe::App for App {
                     ToolStatus::Err(e) => self.notice = Some((true, i18n::fill(tr.tool_fail, &[&e]))),
                     ToolStatus::Running => {}
                 }
+            }
+        }
+        // 本地 LLM 模型下载:完成即提示并释放按钮
+        let llm_done = self
+            .llm_job
+            .as_mut()
+            .map(|j| {
+                j.poll();
+                !matches!(j.status, ToolStatus::Running)
+            })
+            .unwrap_or(false);
+        if llm_done {
+            let job = self.llm_job.take().expect("llm_job");
+            let tr = self.lang.strings();
+            match job.status {
+                ToolStatus::Ok(p) => {
+                    // 下载完成:模型路径写进设置草稿(避免 models\llm 里多个 GGUF 时按字母序挑错)
+                    if let Some(d) = self.draft.as_mut() {
+                        d.llm_local_model = p.to_string_lossy().to_string();
+                    }
+                    self.notice = Some((false, i18n::fill(tr.llm_dl_ok, &[&p.display().to_string()])));
+                }
+                ToolStatus::Err(e) => self.notice = Some((true, format!("{}: {e}", tr.llm_dl_fail))),
+                ToolStatus::Running => {}
             }
         }
         while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
@@ -749,6 +970,11 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
     let notice = app.notice.clone();
     let report = app.report_text.clone();
     let package = app.package_dir.clone();
+    // 说话人键 → 已命名映射(展开视图点击改名后,旧行的名字也跟着刷新)
+    let name_map = match (app.show_transcript, app.session.as_ref()) {
+        (true, Some(s)) => db::load_speaker_names(&app.conn, s.meeting_id).unwrap_or_default(),
+        _ => Default::default(),
+    };
 
     egui::CentralPanel::default()
         .frame(Frame::new().fill(Color32::TRANSPARENT))
@@ -766,7 +992,7 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
             }
 
-            // 行1:状态点 + 状态/计时 + ✕(整行拖拽)
+            // 行1:状态点 + 状态/计时 + ×(整行拖拽)
             let header = rect_from(rect.min + egui::vec2(8.0, 6.0), egui::vec2(rect.width() - 16.0, 20.0));
             let resp = ui.allocate_rect(header, egui::Sense::click_and_drag());
             if resp.dragged_by(PointerButton::Primary) {
@@ -786,9 +1012,11 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                 FontId::proportional(13.0),
                 Color32::from_rgb(225, 228, 235),
             );
-            let r_close = head_btn(ui, header.right() - 8.0, header.center().y, "✕");
+            let r_close = head_btn(ui, header.right() - 8.0, header.center().y, "×");
+            // ⚙ 与 pointtofixcraft 同款:标题旁的设置入口(原先在按钮行,挪到标题旁)
+            let r_gear = head_btn(ui, header.right() - 34.0, header.center().y, "⚙");
             let r_shot = if mode == Mode::Recording {
-                Some(head_btn(ui, header.right() - 34.0, header.center().y, "📷"))
+                Some(head_btn(ui, header.right() - 60.0, header.center().y, "📷"))
             } else {
                 None
             };
@@ -796,6 +1024,8 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                 let p = ui.input(|i| i.pointer.interact_pos().unwrap_or_default());
                 if r_close.contains(p) {
                     app.quit();
+                } else if r_gear.contains(p) {
+                    app.open_settings();
                 } else if let Some(rs) = r_shot {
                     if rs.contains(p) {
                         app.shot_window_now();
@@ -811,7 +1041,9 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                 )),
                 |ui| {
                     ui.horizontal(|ui| {
-                        ui.add_space(8.0);
+                        // 132px 宽放三个按钮,收紧行距
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add_space(6.0);
                         let tr = app.lang.strings();
                         let (label, fill) = match mode {
                             Mode::Idle => (tr.btn_start_s, Color32::from_rgb(34, 139, 84)),
@@ -820,18 +1052,17 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                         };
                         let btn = egui::Button::new(RichText::new(label).size(14.0).color(Color32::WHITE))
                             .fill(fill)
-                            .min_size(egui::vec2(72.0, 30.0))
+                            .min_size(egui::vec2(64.0, 30.0))
                             .corner_radius(CornerRadius::same(7));
                         if ui.add_enabled(mode != Mode::Processing, btn).clicked() {
                             app.toggle_meeting();
                         }
-                        if ui.add(egui::Button::new(RichText::new("⚙").size(13.0))).clicked() {
-                            if app.draft.is_none() {
-                                app.draft = Some(Draft::from_cfg(&app.cfg));
-                            }
-                            app.show_settings = true;
+                        // ✂ 全屏截图(pointtofixcraft --capture-full;录音中自动关联会议包)
+                        if ui.add(egui::Button::new(RichText::new("✂").size(13.0)).min_size(egui::vec2(24.0, 30.0))).clicked() {
+                            app.shot_full_now();
                         }
-                        if ui.add(egui::Button::new(RichText::new("≡").size(13.0))).clicked() {
+                        // ⚙ 已挪到标题旁(与 pointtofixcraft 一致),这里只剩 ≡
+                        if ui.add(egui::Button::new(RichText::new("≡").size(13.0)).min_size(egui::vec2(24.0, 30.0))).clicked() {
                             app.show_transcript = !app.show_transcript;
                         }
                     });
@@ -860,14 +1091,36 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                 },
             );
 
-            // 展开视图(≡):转写 + 报告 + 打开会议包
+            // 展开视图(≡):转写 + 报告 + 打开会议包(底部留出版本行高度)
             if app.show_transcript {
                 ui.allocate_new_ui(
                     egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
                         rect.min + egui::vec2(10.0, 96.0),
-                        egui::vec2(rect.width() - 20.0, rect.height() - 102.0),
+                        egui::vec2(rect.width() - 20.0, rect.height() - 124.0),
                     )),
                     |ui| {
+                        // 改名编辑器:点击说话人标签弹出,回车/✓ 确认
+                        if let Some(rk) = app.renaming.clone() {
+                            let disp = name_map.get(&rk).cloned().unwrap_or_else(|| rk.clone());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{disp} →")).size(12.5).color(Color32::from_rgb(140, 200, 160)));
+                                let resp = ui.add(TextEdit::singleline(&mut app.rename_input).desired_width(180.0).hint_text(app.lang.strings().input_name));
+                                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if ui.button("✓").clicked() || enter {
+                                    let name = app.rename_input.trim().to_string();
+                                    let mid = app.session.as_ref().map(|s| s.meeting_id);
+                                    if let (Some(mid), false) = (mid, name.is_empty()) {
+                                        let _ = db::upsert_speaker(&app.conn, mid, &rk, Some(&name), None, None);
+                                    }
+                                    app.renaming = None;
+                                    app.rename_input.clear();
+                                }
+                                if ui.button("×").clicked() {
+                                    app.renaming = None;
+                                    app.rename_input.clear();
+                                }
+                            });
+                        }
                         if let Some(t) = &report {
                             ui.label(RichText::new(t).size(11.0).color(Color32::from_rgb(140, 200, 160)));
                         }
@@ -876,16 +1129,39 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                             if mode != Mode::Processing && ui.add(egui::Button::new(tr.open_package)).clicked() {
                                 let _ = std::process::Command::new("explorer").arg(pkg).spawn();
                             }
+                            // 用内置 Nomo 阅读 minutes.md(总结+截图一屏看完);无阅读器/无纪要则不显示
+                            if mode != Mode::Processing {
+                                let minutes = std::path::Path::new(pkg.as_str()).join("minutes.md");
+                                if let (Some(nomo), true) = (nomo_exe(), minutes.exists()) {
+                                    if ui.add(egui::Button::new(tr.view_nomo)).clicked() {
+                                        let _ = std::process::Command::new(&nomo).arg(&minutes).spawn();
+                                    }
+                                }
+                            }
                         }
                         ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                            for (rel_ms, spk, text, trn) in lines.iter().rev() {
+                            for (rel_ms, spk, disp, text, trn) in lines.iter().rev() {
                                 let t = (rel_ms / 1000).max(0);
                                 let ts = format!("{:02}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60);
-                                ui.label(
-                                    RichText::new(format!("[{ts}] {spk} {text}"))
-                                        .size(12.5)
-                                        .color(Color32::from_rgb(210, 214, 222)),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("[{ts}]")).size(11.5).color(Color32::from_rgb(150, 158, 172)));
+                                    // 说话人标签可点击改名(未命名显示 A/B/C,已命名显示名字)
+                                    if !spk.is_empty() {
+                                        let shown = name_map.get(spk).cloned().unwrap_or_else(|| disp.clone());
+                                        let who = RichText::new(shown)
+                                            .size(12.5)
+                                            .color(Color32::from_rgb(126, 192, 255))
+                                            .underline();
+                                        let resp = ui
+                                            .add(egui::Label::new(who).sense(egui::Sense::click()))
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if resp.clicked() {
+                                            app.renaming = Some(spk.clone());
+                                            app.rename_input.clear();
+                                        }
+                                    }
+                                    ui.label(RichText::new(text).size(12.5).color(Color32::from_rgb(210, 214, 222)));
+                                });
                                 if !trn.trim().is_empty() {
                                     ui.label(RichText::new(format!("      {trn}")).size(11.0).color(Color32::from_rgb(150, 170, 200)));
                                 }
@@ -894,6 +1170,15 @@ fn paint_panel(app: &mut App, ctx: &egui::Context) {
                     },
                 );
             }
+
+            // 底部版本行(同 pointtofixcraft):常显当前版本,左缘对齐标题文字
+            ui.painter().text(
+                Pos2::new(rect.min.x + 24.0, rect.max.y - 11.0),
+                Align2::LEFT_CENTER,
+                format!("v{VERSION}"),
+                FontId::proportional(9.5),
+                Color32::from_rgb(140, 146, 158),
+            );
         });
 }
 
@@ -926,8 +1211,8 @@ fn chrono_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 无边框对话框外壳(用于独立原生视口):深色圆角底 + 可拖拽标题栏 + ✕。
-/// body/footer 分别填充内容区(自行滚动)和底部按钮区。返回是否点了 ✕。
+/// 无边框对话框外壳(用于独立原生视口):深色圆角底 + 可拖拽标题栏 + ×。
+/// body/footer 分别填充内容区(自行滚动)和底部按钮区。返回是否点了 ×。
 fn dialog_shell(
     ctx: &egui::Context,
     vp: ViewportId,
@@ -946,7 +1231,7 @@ fn dialog_shell(
                 Color32::from_rgba_unmultiplied(24, 26, 34, 245),
             );
 
-            // 标题栏:整行拖拽,右侧 ✕
+            // 标题栏:整行拖拽,右侧 ×
             let header =
                 rect_from(rect.min + egui::vec2(12.0, 5.0), egui::vec2(rect.width() - 24.0, 26.0));
             let resp = ui.allocate_rect(header, egui::Sense::click_and_drag());
@@ -960,7 +1245,7 @@ fn dialog_shell(
                 FontId::proportional(14.0),
                 Color32::from_rgb(225, 228, 235),
             );
-            let r_close = head_btn(ui, header.right() - 12.0, header.center().y, "✕");
+            let r_close = head_btn(ui, header.right() - 12.0, header.center().y, "×");
             if ui.input(|i| i.pointer.primary_released()) {
                 let p = ui.input(|i| i.pointer.interact_pos().unwrap_or_default());
                 if r_close.contains(p) {
@@ -1117,7 +1402,8 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
         egui::ViewportBuilder::default()
             .with_title(title.clone())
             .with_inner_size(SETTINGS_SIZE)
-            .with_resizable(false)
+            .with_min_inner_size(SETTINGS_MIN_SIZE)
+            .with_resizable(true)
             .with_decorations(false)
             .with_transparent(true)
             .with_window_level(if on_top {
@@ -1137,18 +1423,76 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                     let Some(d) = app.draft.as_mut() else { return };
                     ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                         ui.heading(tr.sec_stt);
-                        row(ui, tr.lbl_language, &mut d.stt_lang, "zh / en / auto");
+                        // 识别语言下拉(SenseVoice:auto/zh/en/ja/ko/yue)
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr.lbl_language).size(12.5));
+                            let mut lang = d.stt_lang.clone();
+                            egui::ComboBox::from_id_salt("stt-language")
+                                .selected_text(stt_lang_label(&lang))
+                                .show_ui(ui, |ui| {
+                                    for (code, name) in STT_LANGS {
+                                        ui.selectable_value(&mut lang, (*code).to_string(), *name);
+                                    }
+                                });
+                            d.stt_lang = lang;
+                        });
                         row(ui, tr.lbl_window, &mut d.stt_window, "12");
                         ui.separator();
                         ui.heading(tr.sec_diarize);
                         ui.checkbox(&mut d.diarize_enabled, tr.lbl_diarize_on);
                         ui.separator();
                         ui.heading(tr.sec_llm);
-                        row(ui, tr.lbl_base, &mut d.llm_base, tr.hint_base);
-                        row(ui, tr.lbl_key, &mut d.llm_key, "");
-                        row(ui, tr.lbl_llm_model, &mut d.llm_model, tr.hint_llm_model);
-                        ui.checkbox(&mut d.llm_schema, tr.lbl_schema);
-                        row(ui, tr.lbl_ctx, &mut d.llm_ctx, "200000");
+                        // 总结服务:API(OpenAI 兼容)/ 本地 llama.cpp
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr.lbl_llm_provider).size(12.5));
+                            let mut prov = d.llm_provider.clone();
+                            egui::ComboBox::from_id_salt("llm-provider")
+                                .selected_text(if prov == "local" { tr.opt_llm_local } else { tr.opt_llm_api })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut prov, "api".to_string(), tr.opt_llm_api);
+                                    ui.selectable_value(&mut prov, "local".to_string(), tr.opt_llm_local);
+                                });
+                            d.llm_provider = prov;
+                        });
+                        if d.llm_provider == "local" {
+                            ui.label(RichText::new(tr.llm_local_hint).size(11.0).color(Color32::from_rgb(150, 158, 172)));
+                            // 按本机显卡分档推荐(启动时 DXGI 探测)
+                            let rec = mrc_core::llm::recommend_for_machine();
+                            let gpu_text = match &app.gpu_summary {
+                                Some((name, mb)) => {
+                                    let size = if *mb >= 1024 { format!("{:.0} GB", *mb as f64 / 1024.0) } else { format!("{mb} MB") };
+                                    i18n::fill(tr.llm_gpu_line, &[name, &size])
+                                }
+                                None => tr.llm_gpu_none.to_string(),
+                            };
+                            ui.label(RichText::new(gpu_text).size(11.5).color(Color32::from_rgb(150, 158, 172)));
+                            ui.label(RichText::new(i18n::fill(tr.llm_rec_is, &[rec.label])).size(11.5).color(Color32::from_rgb(140, 200, 160)));
+                            let llm_installing = app.llm_job.is_some();
+                            let dl_label = if llm_installing { tr.llm_dl_running } else { tr.btn_llm_dl };
+                            if ui.add_enabled(!llm_installing, egui::Button::new(RichText::new(dl_label).size(12.0))).clicked() {
+                                let cfg2 = app.cfg.clone();
+                                let (file, url) = (rec.file, rec.url);
+                                app.llm_job = Some(DownloadJob::start(move || {
+                                    mrc_core::llm::download_model_file(file, url, &cfg2).map_err(|e| format!("{e:#}"))
+                                }));
+                                // 推荐档的上下文窗口顺手填好
+                                d.llm_local_ctx = rec.ctx.to_string();
+                            }
+                            ui.horizontal(|ui| {
+                                ui.hyperlink_to("Qwen3-8B (4.7GB)", mrc_core::llm::RECOMMENDED_MODEL_URL);
+                                ui.hyperlink_to("Qwen3-4B (2.3GB)", mrc_core::llm::SMALL_MODEL_URL);
+                                ui.hyperlink_to("Qwen3-1.7B (1GB)", mrc_core::llm::TINY_MODEL_URL);
+                                ui.hyperlink_to("llama.cpp", mrc_core::llm::LLAMA_CPP_RELEASES);
+                            });
+                            row(ui, tr.lbl_llm_local_model, &mut d.llm_local_model, tr.hint_llm_local_model);
+                            row(ui, tr.lbl_ctx, &mut d.llm_local_ctx, "32768");
+                        } else {
+                            row(ui, tr.lbl_base, &mut d.llm_base, tr.hint_base);
+                            row(ui, tr.lbl_key, &mut d.llm_key, "");
+                            row(ui, tr.lbl_llm_model, &mut d.llm_model, tr.hint_llm_model);
+                            ui.checkbox(&mut d.llm_schema, tr.lbl_schema);
+                            row(ui, tr.lbl_ctx, &mut d.llm_ctx, "200000");
+                        }
                         ui.separator();
                         ui.heading(tr.sec_subtitle);
                         ui.checkbox(&mut d.sub_enabled, tr.lbl_sub_on);
@@ -1162,7 +1506,6 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                         row(ui, tr.lbl_shots_window, &mut d.shots_window, "30");
                         row(ui, tr.lbl_chunk_window, &mut d.chunk_window, "300");
                         row(ui, tr.lbl_chunk_tokens, &mut d.chunk_tokens, "1000");
-                        row(ui, tr.lbl_rag, &mut d.rag_base, tr.hint_rag);
                         ui.separator();
                         ui.heading(tr.sec_translate);
                         ui.horizontal(|ui| {
@@ -1171,20 +1514,32 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                             egui::ComboBox::from_id_salt("tr-provider")
                                 .selected_text(match prov.as_str() {
                                     "local" => "Local (Hy-MT3)",
-                                    "llm" => "LLM",
+                                    "llm" => tr.tr_opt_llm,
                                     "baidu" => "Baidu",
                                     _ => "off",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut prov, "none".to_string(), "off");
                                     ui.selectable_value(&mut prov, "local".to_string(), "Local (Hy-MT3)");
-                                    ui.selectable_value(&mut prov, "llm".to_string(), "LLM");
+                                    ui.selectable_value(&mut prov, "llm".to_string(), tr.tr_opt_llm);
                                     ui.selectable_value(&mut prov, "baidu".to_string(), "Baidu");
                                 });
                             d.tr_provider = prov;
                         });
-                        row(ui, tr.lbl_tr_from, &mut d.tr_from, "zh");
-                        row(ui, tr.lbl_tr_to, &mut d.tr_to, "en");
+                        ui.label(RichText::new(tr.tr_src_auto).size(11.0).color(Color32::from_rgb(150, 158, 172)));
+                        // 目标语言下拉(en/zh/de/ja;MT3/LLM 提示词/百度 API 共用)
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr.lbl_tr_to).size(12.5));
+                            let mut to = d.tr_to.clone();
+                            egui::ComboBox::from_id_salt("tr-target")
+                                .selected_text(tr_to_label(&to))
+                                .show_ui(ui, |ui| {
+                                    for (code, name) in TR_TARGET_LANGS {
+                                        ui.selectable_value(&mut to, (*code).to_string(), *name);
+                                    }
+                                });
+                            d.tr_to = to;
+                        });
                         if d.tr_provider == "baidu" {
                             row(ui, tr.lbl_tr_appid, &mut d.tr_appid, "");
                             row(ui, tr.lbl_tr_secret, &mut d.tr_secret, "");
@@ -1192,6 +1547,26 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                         ui.separator();
                         ui.heading(tr.sec_shots);
                         row(ui, tr.lbl_shots_default, &mut d.shots_default_win, tr.hint_shots_default);
+                        // 从运行中的窗口挑(设置打开时快照;↻ 重取)。选中即写入上面那行。
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr.lbl_pick_window).size(12.5));
+                            let titles = app.windows_cache.clone().unwrap_or_default();
+                            let mut picked: Option<String> = None;
+                            egui::ComboBox::from_id_salt("shot-window-pick")
+                                .selected_text(tr.pick_window_placeholder)
+                                .height(320.0)
+                                .show_ui(ui, |ui| {
+                                    for t in &titles {
+                                        ui.selectable_value(&mut picked, Some(t.clone()), t);
+                                    }
+                                });
+                            if let Some(t) = picked {
+                                d.shots_default_win = t;
+                            }
+                            if ui.button(RichText::new("↻").size(12.0)).clicked() {
+                                app.windows_cache = Some(mrc_core::windowcap::list_window_titles());
+                            }
+                        });
                         row(ui, tr.lbl_auto_shots, &mut d.shots_auto, "0");
                         ui.separator();
                         ui.heading(tr.sec_tools);
@@ -1205,6 +1580,12 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
                             }
                         };
                         ui.label(RichText::new(&pf_state).size(12.0).color(Color32::from_rgb(150, 158, 172)));
+                        // 便携包下载地址(release 资产 zip;解压目录填上方"来源"即可安装)
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr.pf_download).size(11.5).color(Color32::from_rgb(150, 158, 172)));
+                            ui.hyperlink_to("GitHub", mrc_core::tools::RELEASES_GITHUB);
+                            ui.hyperlink_to("Gitee", mrc_core::tools::RELEASES_GITEE);
+                        });
                         row(ui, tr.lbl_pf_src, &mut d.pf_url, tr.hint_pf);
                         // 界面语言(保存后生效;托盘文案需重启)
                         let mut lang_code = app.cfg.lang.clone().unwrap_or_default();
@@ -1265,7 +1646,7 @@ fn paint_settings(app: &mut App, ctx: &egui::Context) {
     );
 
     if closed {
-        app.show_settings = false; // ✕ 关闭,草稿保留(与取消不同)
+        app.show_settings = false; // × 关闭,草稿保留(与取消不同)
     }
     if cancel_clicked {
         app.draft = None;
@@ -1311,4 +1692,49 @@ fn row(ui: &mut egui::Ui, label: &str, val: &mut String, hint: &str) {
         ui.label(RichText::new(label).size(12.5)).on_hover_text(hint);
         ui.add(TextEdit::singleline(val).desired_width(230.0).hint_text(hint));
     });
+}
+
+/// SenseVoice 支持的识别语言(auto = 引擎自动判断)
+const STT_LANGS: &[(&str, &str)] = &[
+    ("auto", "自动 Auto"),
+    ("zh", "中文"),
+    ("en", "English"),
+    ("ja", "日本語"),
+    ("ko", "한국어"),
+    ("yue", "粤语"),
+];
+
+fn stt_lang_label(code: &str) -> &'static str {
+    STT_LANGS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, n)| *n)
+        .unwrap_or("自动 Auto")
+}
+
+/// 翻译目标语言候选(MT3 模板/LLM 提示词/百度 API 都认识;native 名不随界面语言变)
+const TR_TARGET_LANGS: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("zh", "中文"),
+    ("de", "Deutsch"),
+    ("ja", "日本語"),
+];
+
+fn tr_to_label(code: &str) -> &'static str {
+    TR_TARGET_LANGS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, n)| *n)
+        .unwrap_or("English")
+}
+
+/// 定位内置 Nomo 阅读器(thirdpart/Nomo/nomo.exe):便携包在 exe 旁,
+/// 开发态在 target/release 上两级(仓库根)。都没有则返回 None(按钮隐藏)。
+fn nomo_exe() -> Option<std::path::PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidates = [
+        dir.join("thirdpart").join("Nomo").join("nomo.exe"),
+        dir.join("..").join("..").join("thirdpart").join("Nomo").join("nomo.exe"),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
 }

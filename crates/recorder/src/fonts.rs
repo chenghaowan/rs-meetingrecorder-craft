@@ -19,6 +19,17 @@ pub fn load_cjk_font(ctx: &Context) {
             if let Some(fam) = defs.families.get_mut(&FontFamily::Monospace) {
                 fam.push("cjk".into());
             }
+            // 韩文兜底(msyh 韩文字形缺失,语言下拉的 한국어 会出豆腐块)
+            if let Ok(kor) = std::fs::read(r"C:\Windows\Fonts\malgun.ttf") {
+                defs.font_data
+                    .insert("kor".into(), std::sync::Arc::new(FontData::from_owned(kor)));
+                if let Some(fam) = defs.families.get_mut(&FontFamily::Proportional) {
+                    fam.push("kor".into());
+                }
+                if let Some(fam) = defs.families.get_mut(&FontFamily::Monospace) {
+                    fam.push("kor".into());
+                }
+            }
             ctx.set_fonts(defs);
             return;
         }

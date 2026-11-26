@@ -84,6 +84,18 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_vp_model {
         conn.execute_batch("ALTER TABLE voiceprints ADD COLUMN embedding_model TEXT;")?;
     }
+    // v0.1.3:实时说话人簇质心(录音中逐段标注 A/B/C 时写入,供会后声纹预填/注册)
+    let has_spk_centroid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('speakers') WHERE name='centroid'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_spk_centroid {
+        conn.execute_batch("ALTER TABLE speakers ADD COLUMN centroid BLOB;")?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meetings (
            id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +137,14 @@ fn migrate(conn: &Connection) -> Result<()> {
            llm_meta_json    TEXT,
            created_at       INTEGER
          );
+
+         CREATE TABLE IF NOT EXISTS meeting_shots (
+           id         INTEGER PRIMARY KEY AUTOINCREMENT,
+           meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+           created_at INTEGER NOT NULL,
+           file_path  TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_meeting_shots ON meeting_shots(meeting_id, created_at);
 
          CREATE TABLE IF NOT EXISTS voiceprints (
            id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -377,5 +397,65 @@ pub fn load_speakers(
         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// 写入某说话人簇的质心(实时标注在停止录音时调用;行须先 upsert_speaker)
+pub fn set_speaker_centroid(conn: &Connection, meeting_id: i64, key: &str, blob: &[u8]) -> Result<()> {
+    conn.execute(
+        "UPDATE speakers SET centroid=?3 WHERE meeting_id=?1 AND speaker_key=?2",
+        rusqlite::params![meeting_id, key, blob],
+    )?;
+    Ok(())
+}
+
+/// 读本会议全部簇质心(speaker_key → BLOB;实时标注链路声纹预填用)
+pub fn load_speaker_centroids(
+    conn: &Connection,
+    meeting_id: i64,
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    let mut st = conn.prepare(
+        "SELECT speaker_key, centroid FROM speakers
+         WHERE meeting_id=?1 AND centroid IS NOT NULL",
+    )?;
+    let rows = st.query_map([meeting_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?)
+}
+
+/// 已命名说话人映射(key → 显示名),实时列表/字幕刷新用
+pub fn load_speaker_names(
+    conn: &Connection,
+    meeting_id: i64,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut st = conn.prepare(
+        "SELECT speaker_key, name FROM speakers
+         WHERE meeting_id=?1 AND name IS NOT NULL",
+    )?;
+    let rows = st.query_map([meeting_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?)
+}
+
+/// 会议直拍登记(✂/📷/自动截图:--out 直存 data_dir\shots,不进 pointtofix 画廊)
+pub fn insert_meeting_shot(conn: &Connection, meeting_id: i64, created_at: i64, file_path: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meeting_shots(meeting_id, created_at, file_path) VALUES (?1,?2,?3)",
+        rusqlite::params![meeting_id, created_at, file_path],
+    )?;
+    Ok(())
+}
+
+/// 读本会议全部直拍((created_at, data_dir 相对路径),按时间序)
+pub fn load_meeting_shots(conn: &Connection, meeting_id: i64) -> Result<Vec<(i64, String)>> {
+    let mut st = conn.prepare(
+        "SELECT created_at, file_path FROM meeting_shots
+         WHERE meeting_id=?1 ORDER BY created_at",
+    )?;
+    let rows = st.query_map([meeting_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 

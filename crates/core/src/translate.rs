@@ -4,6 +4,9 @@
 //! - "baidu":移植 ltl-manage utils/translator.py 的百度翻译开放 API
 //!   (appid+secret MD5 签名,兼容经典/AI 两种响应格式,进程内缓存)。
 //!
+//! 源语言一律自动识别:Hy-MT3 官方模板只给目标语言;LLM 提示词让模型自己认源语言;
+//! 百度 API from=auto。只有目标语言 [translate].to_lang 需要配置。
+//!
 //! 各 provider 共用一层文本缓存(键 = provider|from|to|text)。
 
 use std::collections::HashMap;
@@ -160,8 +163,7 @@ impl Translator {
                 .collect::<Vec<_>>()
                 .join("\n");
             let system = format!(
-                "你是专业翻译。把用户给出的编号行逐行从{}翻译成{}。工业/工程术语(如 DFM、CAE、缩水、偷胶、拔模)按行业惯例翻译或保留。只输出相同编号的译文,格式为 \"N. 译文\",不要任何解释。",
-                lang_name(&self.cfg.from_lang),
+                "你是专业翻译。自动识别每行源语言,把用户给出的编号行逐行翻译成{}。工业/工程术语(如 DFM、CAE、缩水、偷胶、拔模)按行业惯例翻译或保留。只输出相同编号的译文,格式为 \"N. 译文\",不要任何解释。",
                 lang_name(&self.cfg.to_lang)
             );
             match chat_text(llm, &self.agent, &system, &numbered) {
