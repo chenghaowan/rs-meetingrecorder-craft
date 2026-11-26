@@ -2610,7 +2610,7 @@ dependencies = [
 
 [[package]]
 name = "mrc-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "mrc-postprocess"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "image",
@@ -2642,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "mrc-recorder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
